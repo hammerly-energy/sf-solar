@@ -1,0 +1,12 @@
+[project]
+name = "sf-solar"
+version = "0.1.0"
+description = "Near-real-time estimate of aggregate rooftop solar generation in San Francisco"
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib>=3.11.1",
+    "pvlib>=0.15.2",
+]
+
+[tool.uv]
+package = false
