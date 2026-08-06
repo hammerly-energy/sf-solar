@@ -63,6 +63,7 @@ Don't relitigate these without telling me why:
 - **Plain HTML + JavaScript** for the frontend. Chart.js for time series, MapLibre for maps. **No React**, no build step, no bundler.
 - **`uv`** for Python environment and dependency management.
 - Fleet data comes from the CA DG Stats **Interconnected Project Sites** dataset (not the Applications dataset).
+- **GitHub Pages deploys via a GitHub Actions workflow** (`.github/workflows/pages.yml`), not the classic "deploy from branch" setting. That setting only serves the repo root or a `/docs` folder, and the site lives in `site/`. The workflow packages `site/` as the Pages artifact on every push to `main`.
 
 ## Scope — deferred until later
 
@@ -76,7 +77,7 @@ Not in scope right now. If they'd help, mention it, but don't build them:
 
 ## Where I am now
 
-**Level 1** — one hypothetical SF rooftop, clear-sky output for one day, plotted.
+**Level 2** — Level 1's curve is live on GitHub Pages at https://hammerly-energy.github.io/sf-solar/. Still one hypothetical rooftop, still clear-sky only (no real fleet, no real clouds yet).
 
 Full staged plan is in `docs/sf-solar-roadmap.md`. Technical design is in `docs/sf-solar-nowcast-architecture.md`. Read both if you need context beyond this file.
 
