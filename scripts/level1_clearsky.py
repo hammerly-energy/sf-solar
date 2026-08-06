@@ -13,6 +13,9 @@ CLAUDE.md.
 Run: uv run python scripts/level1_clearsky.py
 """
 
+import json
+from pathlib import Path
+
 import pandas as pd
 import pvlib
 import matplotlib.pyplot as plt
@@ -36,6 +39,21 @@ AMBIENT_TEMP_C = 20
 WIND_SPEED_MS = 2
 
 LOCAL_DATE = "2026-06-21"  # near summer solstice
+
+
+def export_json(dc_power_kw, ac_power_kw, path):
+    """Write today's DC/AC curve to JSON so the website can fetch and chart it."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+    data = [
+        {"time": timestamp.isoformat(), "dc_kw": round(dc_val, 3), "ac_kw": round(ac_val, 3)}
+        for (timestamp, dc_val), (_, ac_val) in zip(dc_power_kw.items(), ac_power_kw.items())
+    ]
+
+    with open(path, "w") as f:
+        json.dump(data, f)
+
+    print(f"Saved chart data to {path}")
 
 
 def main():
@@ -112,6 +130,8 @@ def main():
     output_path = "data/level1_clearsky.png"
     fig.savefig(output_path, dpi=150)
     print(f"Saved plot to {output_path}")
+
+    export_json(dc_power_kw, ac_power_kw, "site/data/level1.json")
 
 
 if __name__ == "__main__":

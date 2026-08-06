@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>SF Solar — hypothetical rooftop</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3"></script>
+  <style>
+    body { font-family: sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; }
+    canvas { max-height: 500px; }
+  </style>
+</head>
+<body>
+  <h1>San Francisco Solar — Level 1</h1>
+  <p>Clear-sky output for one hypothetical rooftop: 5 kW DC, 20° tilt, south-facing, 4 kW inverter.</p>
+  <canvas id="chart"></canvas>
+
+  <script>
+    fetch("data/level1.json")
+      .then(response => response.json())
+      .then(data => {
+        const labels = data.map(row => new Date(row.time));
+        const dcValues = data.map(row => row.dc_kw);
+        const acValues = data.map(row => row.ac_kw);
+
+        new Chart(document.getElementById("chart"), {
+          type: "line",
+          data: {
+            labels: labels,
+            datasets: [
+              {
+                label: "DC output (kW)",
+                data: dcValues,
+                borderColor: "gray",
+                borderDash: [5, 5],
+                pointRadius: 0,
+              },
+              {
+                label: "AC output (kW)",
+                data: acValues,
+                borderColor: "orange",
+                pointRadius: 0,
+              },
+            ],
+          },
+          options: {
+            scales: {
+              x: {
+                type: "time",
+                time: { unit: "hour" },
+                title: { display: true, text: "Time (Pacific)" },
+              },
+              y: {
+                title: { display: true, text: "Power (kW)" },
+              },
+            },
+          },
+        });
+      });
+  </script>
+</body>
+</html>
