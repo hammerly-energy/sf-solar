@@ -11,10 +11,8 @@ DSM pixels.
 Three modes (first CLI arg):
   zurich  -- Wiedikon, Zurich. WORKING. SWISSIMAGE (10cm/px) + swissSURFACE3D
              DSM (0.5m/px), both openly licensed. Classifier clears its own
-             0.5 decision threshold here; full pipeline runs end-to-end.
-             Known bug: fetch_dsm_chip() only uses the first of several DSM
-             tiles covering the bbox instead of mosaicking -- footprints
-             outside that one tile wrongly report "too small to fit".
+             0.5 decision threshold here; full pipeline runs end-to-end,
+             including DSM mosaicking across all tiles covering the bbox.
   smoke   -- SF Richmond (94118/94121), centered on a permit-verified
              address. KNOWN BROKEN: NAIP is only 0.6m/px vs the ~0.24m/px
              (Google Maps zoom>=19) the model expects; every tile scored
@@ -48,6 +46,7 @@ import rasterio
 import requests
 import torch
 import torch.nn as nn
+from rasterio.merge import merge as merge_rasters
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 from rasterio.windows import from_bounds
 from transformers import SegformerImageProcessor, ViTForImageClassification, ViTImageProcessor
@@ -430,13 +429,14 @@ def fetch_dsm_chip(bbox):
             hrefs.append(href)
     print(f"DSM tiles covering bbox: {len(hrefs)}")
 
-    # bbox typically spans one DSM tile for our test areas; if it spans more,
-    # just use the first -- good enough for a single-array plane fit.
+    # bbox commonly spans several DSM tiles (they're smaller than the
+    # SWISSIMAGE tiles) -- mosaic all of them, then crop to bbox, so no
+    # array footprint silently falls outside a single tile's window.
     with rasterio.open(hrefs[0]) as src:
-        window = from_bounds(*rasterio.warp.transform_bounds("EPSG:4326", src.crs, *bbox), src.transform)
-        elevation = src.read(1, window=window)
-        transform = src.window_transform(window)
         crs = src.crs
+    merge_bounds = rasterio.warp.transform_bounds("EPSG:4326", crs, *bbox)
+    mosaic, transform = merge_rasters(hrefs, bounds=merge_bounds)
+    elevation = mosaic[0]  # single band
     return elevation, transform, crs
 
 
