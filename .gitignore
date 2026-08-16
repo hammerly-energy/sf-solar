@@ -2,3 +2,6 @@
 data/raw/
 __pycache__/
 .venv/
+
+# CV detour test tiles -- large, throwaway debug output, not a deliverable
+data/level3_cv_*.png

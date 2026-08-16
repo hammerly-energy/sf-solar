@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Near-real-time estimate of aggregate rooftop solar generation in San Francisco"
 requires-python = ">=3.12"
 dependencies = [
+    "contextily>=1.7.1",
     "matplotlib>=3.11.1",
+    "pandas>=3.0.5",
     "pvlib>=0.15.2",
 ]
 
