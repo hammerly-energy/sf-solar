@@ -499,6 +499,106 @@ def add_roof_geometry(arrays, image_transform, dsm_elevation, dsm_transform, ima
         a["tilt_deg"], a["azimuth_deg"] = fit_roof_plane(window, window_transform)
 
 
+def save_roof_geometry_windrose(arrays, output_path):
+    """Polar plot of fitted roof geometry: azimuth as compass angle, tilt as
+    radius, marker size by panel area, color by classifier confidence.
+
+    Azimuth is unreliable on near-flat roofs (small elevation noise flips the
+    fitted downhill direction by a lot), so those points are marked with a
+    dashed ring rather than silently plotted as if the angle were solid.
+    """
+    import matplotlib.colors as mcolors
+    import matplotlib.pyplot as plt
+
+    fitted = [a for a in arrays if a.get("tilt_deg") is not None]
+    if not fitted:
+        print("No arrays with fitted roof geometry -- skipping wind-rose plot.")
+        return
+
+    FLAT_TILT_THRESHOLD_DEG = 2.0  # below this, azimuth is more noise than signal
+    blue_ramp = ["#cde2fb", "#9ec5f4", "#5598e7", "#256abf", "#0d366b"]  # palette steps 100/200/350/500/700
+    cmap = mcolors.LinearSegmentedColormap.from_list("confidence_blue", blue_ramp)
+
+    azimuth_deg = np.array([a["azimuth_deg"] for a in fitted])
+    r = np.array([a["tilt_deg"] for a in fitted])
+    area = np.array([a["pv_area_m2"] for a in fitted])
+    p_pv = np.array([a["p_pv"] for a in fitted])
+    is_flat = r < FLAT_TILT_THRESHOLD_DEG
+
+    r_max = max(r.max() * 1.35, 10)
+    r_label = r_max * 0.86  # ring where decluttered labels sit, outside all data points
+
+    # Labels sharing near-identical azimuth (common near the center, where several
+    # roofs happen to face the same way) would overlap if placed at their raw
+    # angle. Sort by azimuth and push any label less than MIN_GAP_DEG from the
+    # previous one further around the ring -- a leader line still points each
+    # label back to its true marker, so nothing is misrepresented, just decluttered.
+    MIN_GAP_DEG = 16
+    order = np.argsort(azimuth_deg)
+    label_azimuth_deg = azimuth_deg[order].astype(float).copy()
+    for i in range(1, len(label_azimuth_deg)):
+        if label_azimuth_deg[i] - label_azimuth_deg[i - 1] < MIN_GAP_DEG:
+            label_azimuth_deg[i] = label_azimuth_deg[i - 1] + MIN_GAP_DEG
+    unsort = np.argsort(order)
+    label_azimuth_deg = label_azimuth_deg[unsort]  # back to original point order
+
+    theta = np.radians(azimuth_deg)
+    label_theta = np.radians(label_azimuth_deg)
+
+    fig, ax = plt.subplots(figsize=(8.5, 7.8), subplot_kw={"projection": "polar"})
+    ax.set_theta_zero_location("N")
+    ax.set_theta_direction(-1)
+    ax.set_xticks(np.radians([0, 45, 90, 135, 180, 225, 270, 315]))
+    ax.set_xticklabels(["N", "NE", "E", "SE", "S", "SW", "W", "NW"])
+    ax.set_ylim(0, r_max)
+    ax.set_ylabel("")
+    ax.set_title(
+        "Fitted roof geometry -- Wiedikon, Zurich\n(azimuth = compass direction, radius = tilt, from swissSURFACE3D LiDAR)",
+        pad=28,
+    )
+
+    marker_area_pts2 = area * 0.6  # scale factor chosen so the largest (1318 m^2) fits the axes
+    sc = ax.scatter(
+        theta, r, s=marker_area_pts2, c=p_pv, cmap=cmap, vmin=0.2, vmax=1.0,
+        edgecolors="#0b0b0b", linewidths=0.75, alpha=0.9, zorder=3,
+    )
+    if is_flat.any():
+        ax.scatter(
+            theta[is_flat], r[is_flat], s=marker_area_pts2[is_flat] * 1.6,
+            facecolors="none", edgecolors="#52514e", linewidths=1.25,
+            linestyles="dashed", zorder=2,
+        )
+
+    for t, rad, lt, a in zip(theta, r, label_theta, fitted):
+        ax.plot([t, lt], [rad, r_label], color="#c3c2b7", linewidth=0.75, zorder=1)
+        ax.text(
+            lt, r_label, f"{a['pv_area_m2']:.0f} m²" + (" *" if a["tilt_deg"] < FLAT_TILT_THRESHOLD_DEG else ""),
+            fontsize=8, color="#0b0b0b", ha="center", va="center",
+            bbox={"facecolor": "#fcfcfb", "edgecolor": "none", "pad": 1.5},
+        )
+
+    cbar = fig.colorbar(sc, ax=ax, pad=0.12, shrink=0.6, location="right")
+    cbar.set_label("Classifier confidence p(PV)")
+
+    size_handles = [
+        plt.scatter([], [], s=v * 0.6, facecolors="#9ec5f4", edgecolors="#0b0b0b", linewidths=0.75)
+        for v in [100, 500, 1300]
+    ]
+    fig.legend(
+        size_handles, ["100 m²", "500 m²", "1,300 m²"], title="Panel area",
+        loc="lower center", ncol=3, bbox_to_anchor=(0.5, -0.04), frameon=False,
+    )
+
+    fig.text(
+        0.5, -0.005,
+        "* dashed ring = tilt < 2°, near-flat roof -- fitted azimuth is noise-dominated, don't read the exact angle",
+        ha="center", fontsize=8, color="#52514e",
+    )
+    fig.subplots_adjust(bottom=0.22)
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    print(f"Saved roof geometry wind-rose to {output_path}")
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "smoke"
     print(f"Device: {DEVICE}, mode: {mode}")
@@ -565,6 +665,8 @@ def main():
                     f"lat={a['centroid_lat']:.6f}  lon={a['centroid_lon']:.6f}  "
                     f"tilt={a['tilt_deg']:.1f}deg  azimuth={a['azimuth_deg']:.0f}deg"
                 )
+
+        save_roof_geometry_windrose(arrays, "data/level3_cv_zurich_roof_geometry.png")
 
 
 if __name__ == "__main__":
