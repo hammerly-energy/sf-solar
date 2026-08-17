@@ -772,6 +772,84 @@ def save_building_detail(array, output_path):
     print(f"Saved building detail to {output_path}")
 
 
+def save_registration_check(array, image_transform, output_path, margin_m=3):
+    """Sanity check that SWISSIMAGE and the swissSURFACE3D DSM are actually
+    co-registered, rather than just assumed to be because both claim
+    EPSG:2056. Takes the ONE segmentation footprint (the ground truth) and
+    draws its outline on both datasets, in the same shared real-world
+    coordinates -- if the two datasets agree on where things are, the same
+    outline should trace the same physical edges (roofline, courtyard gap)
+    in both panels. A consistent offset between the two would mean the
+    datasets are misaligned; this makes that checkable by eye instead of
+    assumed from the CRS tag.
+    """
+    import matplotlib.colors as mcolors
+    import matplotlib.pyplot as plt
+
+    if array.get("dsm_footprint_mask") is None:
+        print("Selected array has no DSM footprint -- skipping registration check.")
+        return
+
+    tile_transform = rasterio.windows.transform(
+        rasterio.windows.Window(array["x0"], array["y0"], TILE_PX, TILE_PX), image_transform
+    )
+
+    dsm_window = array["dsm_window"]
+    dsm_transform = array["dsm_window_transform"]
+    dsm_left, dsm_bottom, dsm_right, dsm_top = rasterio.transform.array_bounds(*dsm_window.shape, dsm_transform)
+    crop_left, crop_right = dsm_left - margin_m, dsm_right + margin_m
+    crop_bottom, crop_top = dsm_bottom - margin_m, dsm_top + margin_m
+
+    # crop the RGB tile down to the same real-world extent as the DSM window,
+    # so both panels show the same physical area at comparable scale
+    rows, cols = rasterio.transform.rowcol(tile_transform, [crop_left, crop_right], [crop_top, crop_bottom])
+    r0, r1 = sorted((max(int(rows[0]), 0), min(int(rows[1]), TILE_PX)))
+    c0, c1 = sorted((max(int(cols[0]), 0), min(int(cols[1]), TILE_PX)))
+    rgb_crop = np.transpose(array["pixels"][:, r0:r1, c0:c1], (1, 2, 0))
+    mask_crop = array["mask"][r0:r1, c0:c1]
+    rgb_crop_transform = rasterio.windows.transform(rasterio.windows.Window(c0, r0, c1 - c0, r1 - r0), tile_transform)
+    rgb_bounds = rasterio.transform.array_bounds(r1 - r0, c1 - c0, rgb_crop_transform)
+
+    # shared local origin so both panels plot in the identical coordinate frame --
+    # this, not each panel's own data, is what makes the comparison meaningful
+    ox, oy = crop_left, crop_bottom
+
+    def to_extent(bounds):
+        left, bottom, right, top = bounds
+        return [left - ox, right - ox, bottom - oy, top - oy]
+
+    blue_ramp = ["#cde2fb", "#9ec5f4", "#5598e7", "#256abf", "#0d366b"]
+    cmap = mcolors.LinearSegmentedColormap.from_list("elevation_blue", blue_ramp)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+
+    ax1.imshow(rgb_crop, extent=to_extent(rgb_bounds), origin="upper")
+    ax1.contour(mask_crop.astype(float), levels=[0.5], extent=to_extent(rgb_bounds), origin="upper", colors="#eda100", linewidths=2)
+    ax1.set_title("SWISSIMAGE orthophoto\n+ segmentation mask outline")
+    ax1.set_xlabel("East-West (m)")
+    ax1.set_ylabel("North-South (m)")
+
+    im = ax2.imshow(
+        dsm_window, cmap=cmap, extent=to_extent((dsm_left, dsm_bottom, dsm_right, dsm_top)), origin="upper"
+    )
+    ax2.contour(
+        array["dsm_footprint_mask"].astype(float), levels=[0.5],
+        extent=to_extent((dsm_left, dsm_bottom, dsm_right, dsm_top)), origin="upper", colors="#eda100", linewidths=2,
+    )
+    ax2.set_title("swissSURFACE3D DSM height\n+ SAME mask outline")
+    ax2.set_xlabel("East-West (m)")
+    fig.colorbar(im, ax=ax2, label="Height (m)", shrink=0.8)
+
+    for ax in (ax1, ax2):
+        ax.set_xlim(crop_left - ox, crop_right - ox)
+        ax.set_ylim(crop_bottom - oy, crop_top - oy)
+
+    fig.suptitle("Registration check -- same footprint outline, both datasets, shared coordinates")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    print(f"Saved registration check to {output_path}")
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "smoke"
     print(f"Device: {DEVICE}, mode: {mode}")
@@ -852,6 +930,7 @@ def main():
         if fitted:
             best = max(fitted, key=lambda a: a["p_pv"])
             save_building_detail(best, "data/level3_cv_zurich_building_detail.png")
+            save_registration_check(best, transform, "data/level3_cv_zurich_registration_check.png")
 
 
 if __name__ == "__main__":
