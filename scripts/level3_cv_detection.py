@@ -32,7 +32,7 @@ Run (note --isolated -- this repo's own .venv has a newer NumPy that
 conflicts with these pins otherwise):
   uv run --isolated --with "torch>=2.3" --with transformers==4.46.3 \
     --with rasterio --with pystac-client --with planetary-computer \
-    --with matplotlib --with requests \
+    --with matplotlib --with requests --with scipy \
     python scripts/level3_cv_detection.py zurich
 """
 
@@ -440,34 +440,46 @@ def fetch_dsm_chip(bbox):
     return elevation, transform, crs
 
 
-def fit_roof_plane(elevation, transform):
+def fit_roof_plane(elevation, transform, footprint_mask=None):
     """Least-squares plane fit z = a*x + b*y + c over a DSM window.
 
-    Returns (tilt_deg, azimuth_deg). Azimuth is the compass direction the
-    roof slopes DOWN toward (its aspect) -- same convention as pvlib's
-    surface_azimuth (0=N, 90=E, 180=S, 270=W), matching the convention
-    confirmed against the CA DG Stats data key in level3_fleet.py.
+    footprint_mask, if given, is a boolean array the same shape as elevation
+    that's True only for DSM pixels actually under the segmented PV
+    footprint. Without it, every pixel in the (rectangular) window is used,
+    which can include off-roof terrain the window's bounding box happens to
+    cover -- e.g. a courtyard or street visible at the window's edges.
+
+    Returns (tilt_deg, azimuth_deg, (a, b, c)). Azimuth is the compass
+    direction the roof slopes DOWN toward (its aspect) -- same convention as
+    pvlib's surface_azimuth (0=N, 90=E, 180=S, 270=W), matching the
+    convention confirmed against the CA DG Stats data key in level3_fleet.py.
     """
     rows, cols = np.indices(elevation.shape)
     xs, ys = rasterio.transform.xy(transform, rows.ravel(), cols.ravel())
     xs, ys, zs = np.array(xs), np.array(ys), elevation.ravel()
 
     valid = np.isfinite(zs) & (zs > -1000)  # DSM nodata is often a large negative sentinel
+    if footprint_mask is not None:
+        valid &= footprint_mask.ravel()
     A = np.column_stack([xs[valid], ys[valid], np.ones(valid.sum())])
     (a, b, c), *_ = np.linalg.lstsq(A, zs[valid], rcond=None)
 
     tilt_deg = np.degrees(np.arctan(np.hypot(a, b)))
     azimuth_deg = np.degrees(np.arctan2(-a, -b)) % 360
-    return tilt_deg, azimuth_deg
+    return tilt_deg, azimuth_deg, (a, b, c)
 
 
 def add_roof_geometry(arrays, image_transform, dsm_elevation, dsm_transform, image_crs, dsm_crs, margin_px=2):
     """For each detected array, fit a roof plane to the DSM pixels under its
-    segmented footprint and attach tilt/azimuth.
+    segmented footprint and attach tilt/azimuth. The footprint's DSM pixels
+    are split into spatially-connected clusters first (see MIN_CLUSTER_PIXELS
+    below) and each cluster gets its own plane fit -- see a["roof_planes"].
 
     Both SWISSIMAGE and the DSM are natively EPSG:2056, so this is a direct
     coordinate transform, not a reprojection.
     """
+    from scipy import ndimage
+
     for a in arrays:
         if a["pv_pixel_count"] == 0:
             a["tilt_deg"] = a["azimuth_deg"] = None
@@ -484,19 +496,64 @@ def add_roof_geometry(arrays, image_transform, dsm_elevation, dsm_transform, ima
 
         # real-world (x, y) -> DSM pixel indices, then a small bounding window
         dsm_rows, dsm_cols = rasterio.transform.rowcol(dsm_transform, xs, ys)
-        r0, r1 = min(dsm_rows) - margin_px, max(dsm_rows) + margin_px + 1
-        c0, c1 = min(dsm_cols) - margin_px, max(dsm_cols) + margin_px + 1
+        dsm_rows, dsm_cols = np.array(dsm_rows), np.array(dsm_cols)
+        r0, r1 = dsm_rows.min() - margin_px, dsm_rows.max() + margin_px + 1
+        c0, c1 = dsm_cols.min() - margin_px, dsm_cols.max() + margin_px + 1
         r0, c0 = max(r0, 0), max(c0, 0)
         window = dsm_elevation[r0:r1, c0:c1]
         window_transform = rasterio.windows.transform(
             rasterio.windows.Window(c0, r0, c1 - c0, r1 - r0), dsm_transform
         )
 
-        if window.size < 9:  # too small a footprint to fit a plane meaningfully
+        # rasterize the segmentation footprint onto the DSM window: True only for
+        # DSM pixels actually touched by a mask pixel, not just inside the window's
+        # bounding box (which can include off-roof terrain at coarser DSM resolution)
+        footprint_mask = np.zeros(window.shape, dtype=bool)
+        local_rows, local_cols = dsm_rows - r0, dsm_cols - c0
+        in_bounds = (
+            (local_rows >= 0) & (local_rows < window.shape[0]) & (local_cols >= 0) & (local_cols < window.shape[1])
+        )
+        footprint_mask[local_rows[in_bounds], local_cols[in_bounds]] = True
+
+        # a single detected array's footprint can span more than one physical
+        # roof plane -- either genuinely (two roof faces at different pitches)
+        # or spuriously (a disconnected false-positive blob elsewhere in the
+        # tile, e.g. street markings the classifier mistook for panels). Fit
+        # a separate plane per spatially-connected cluster of DSM pixels
+        # rather than one plane across all of them.
+        MIN_CLUSTER_PIXELS = 9
+        labels, n_clusters = ndimage.label(footprint_mask, structure=np.ones((3, 3)))
+        planes = []
+        for label_id in range(1, n_clusters + 1):
+            cluster_mask = labels == label_id
+            if cluster_mask.sum() < MIN_CLUSTER_PIXELS:
+                continue
+            tilt_deg, azimuth_deg, plane_coeffs = fit_roof_plane(window, window_transform, cluster_mask)
+            planes.append(
+                {
+                    "tilt_deg": tilt_deg,
+                    "azimuth_deg": azimuth_deg,
+                    "plane_coeffs": plane_coeffs,
+                    "mask": cluster_mask,
+                    "n_dsm_pixels": int(cluster_mask.sum()),
+                }
+            )
+        planes.sort(key=lambda p: -p["n_dsm_pixels"])
+
+        if not planes:  # every cluster too small to fit a plane meaningfully
             a["tilt_deg"] = a["azimuth_deg"] = None
             continue
 
-        a["tilt_deg"], a["azimuth_deg"] = fit_roof_plane(window, window_transform)
+        # the largest cluster is treated as "the" roof plane for this array
+        # (existing single-plane consumers), with the full cluster list kept
+        # alongside for anything that wants to see all of them
+        a["tilt_deg"] = planes[0]["tilt_deg"]
+        a["azimuth_deg"] = planes[0]["azimuth_deg"]
+        a["plane_coeffs"] = planes[0]["plane_coeffs"]
+        a["roof_planes"] = planes
+        a["dsm_window"] = window
+        a["dsm_window_transform"] = window_transform
+        a["dsm_footprint_mask"] = footprint_mask
 
 
 def save_roof_geometry_windrose(arrays, output_path):
@@ -599,6 +656,80 @@ def save_roof_geometry_windrose(arrays, output_path):
     print(f"Saved roof geometry wind-rose to {output_path}")
 
 
+def save_building_detail(array, output_path):
+    """One building, two views of the same footprint: the SWISSIMAGE tile
+    with its segmented PV mask, next to the raw swissSURFACE3D DSM heights
+    for that footprint and the plane fitted through them.
+
+    Requires add_roof_geometry() to have run on this array first (needs
+    dsm_window / dsm_window_transform / plane_coeffs).
+    """
+    import matplotlib.pyplot as plt
+
+    if array.get("tilt_deg") is None:
+        print("Selected array has no fitted roof geometry -- skipping detail plot.")
+        return
+
+    elevation = array["dsm_window"]
+    transform = array["dsm_window_transform"]
+    planes = array.get("roof_planes") or [
+        {"tilt_deg": array["tilt_deg"], "azimuth_deg": array["azimuth_deg"],
+         "plane_coeffs": array["plane_coeffs"], "mask": array["dsm_footprint_mask"],
+         "n_dsm_pixels": int(array["dsm_footprint_mask"].sum())}
+    ]
+
+    rows, cols = np.indices(elevation.shape)
+    xs, ys = rasterio.transform.xy(transform, rows.ravel(), cols.ravel())
+    xs, ys = np.array(xs).reshape(elevation.shape), np.array(ys).reshape(elevation.shape)
+    valid = np.isfinite(elevation) & (elevation > -1000)
+
+    # recenter to small local offsets (real-world EPSG:2056 coords are ~2.6M/1.2M) and
+    # express height relative to the footprint's own mean, so axis numbers are readable
+    x0, y0, z0 = xs[valid].mean(), ys[valid].mean(), elevation[valid].mean()
+    X, Y, Z = xs - x0, ys - y0, np.where(valid, elevation - z0, np.nan)
+
+    # fixed categorical order (palette.md) -- identity of "which plane", not magnitude
+    cluster_colors = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]
+
+    fig = plt.figure(figsize=(13, 6.5))
+
+    ax1 = fig.add_subplot(1, 2, 1)
+    ax1.imshow(np.transpose(array["pixels"], (1, 2, 0)))
+    overlay = np.zeros((*array["mask"].shape, 4))
+    overlay[array["mask"]] = [1, 1, 0, 0.5]  # yellow, semi-transparent
+    ax1.imshow(overlay)
+    ax1.set_title(f"SWISSIMAGE tile + segmented PV mask\np(PV)={array['p_pv']:.3f}, area={array['pv_area_m2']:.0f} m²")
+    ax1.set_xticks([])
+    ax1.set_yticks([])
+
+    ax2 = fig.add_subplot(1, 2, 2, projection="3d")
+    ax2.plot_surface(X, Y, Z, color="#c3c2b7", edgecolor="none", alpha=0.4)  # neutral terrain context
+    for i, plane in enumerate(planes):
+        color = cluster_colors[i % len(cluster_colors)]
+        a_coef, b_coef, c_coef = plane["plane_coeffs"]
+        plane_Z = (a_coef * xs + b_coef * ys + c_coef) - z0
+        used = plane["mask"] & valid
+        ax2.scatter(
+            X[used], Y[used], Z[used], color=color, edgecolors="#0b0b0b", linewidths=0.3, s=20, depthshade=False,
+            label=f"Plane {i + 1}: tilt={plane['tilt_deg']:.1f}°, az={plane['azimuth_deg']:.0f}° ({plane['n_dsm_pixels']} px)",
+        )
+        # only draw each fitted plane surface over its own cluster's local extent,
+        # not the whole window -- otherwise unrelated planes overplot each other
+        plane_Z_masked = np.where(plane["mask"], plane_Z, np.nan)
+        ax2.plot_surface(X, Y, plane_Z_masked, color=color, alpha=0.3, edgecolor="none")
+    ax2.legend(loc="upper left", fontsize=7, frameon=False)
+    n_planes_note = f" -- {len(planes)} distinct roof planes found" if len(planes) > 1 else ""
+    ax2.set_title(f"swissSURFACE3D DSM heights + fitted plane(s){n_planes_note}")
+    ax2.set_xlabel("East-West (m)")
+    ax2.set_ylabel("North-South (m)")
+    ax2.set_zlabel("Height relative to footprint mean (m)")
+
+    fig.suptitle(f"Building detail -- lat={array['centroid_lat']:.6f}, lon={array['centroid_lon']:.6f}")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    print(f"Saved building detail to {output_path}")
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "smoke"
     print(f"Device: {DEVICE}, mode: {mode}")
@@ -665,8 +796,19 @@ def main():
                     f"lat={a['centroid_lat']:.6f}  lon={a['centroid_lon']:.6f}  "
                     f"tilt={a['tilt_deg']:.1f}deg  azimuth={a['azimuth_deg']:.0f}deg"
                 )
+                if len(a["roof_planes"]) > 1:
+                    for i, plane in enumerate(a["roof_planes"]):
+                        print(
+                            f"      plane {i + 1}: tilt={plane['tilt_deg']:.1f}deg  "
+                            f"azimuth={plane['azimuth_deg']:.0f}deg  n_dsm_px={plane['n_dsm_pixels']}"
+                        )
 
         save_roof_geometry_windrose(arrays, "data/level3_cv_zurich_roof_geometry.png")
+
+        fitted = [a for a in arrays if a.get("tilt_deg") is not None]
+        if fitted:
+            best = max(fitted, key=lambda a: a["p_pv"])
+            save_building_detail(best, "data/level3_cv_zurich_building_detail.png")
 
 
 if __name__ == "__main__":
