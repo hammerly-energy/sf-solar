@@ -440,8 +440,14 @@ def fetch_dsm_chip(bbox):
     return elevation, transform, crs
 
 
+OUTLIER_RESIDUAL_M = 0.3  # a point this far from the fitted plane is treated as a stray LiDAR return, not roof
+MAX_OUTLIER_ITERATIONS = 3
+MAX_OUTLIER_FRACTION = 0.2  # refuse to discard more than this share of a cluster as "artifacts"
+
+
 def fit_roof_plane(elevation, transform, footprint_mask=None):
-    """Least-squares plane fit z = a*x + b*y + c over a DSM window.
+    """Least-squares plane fit z = a*x + b*y + c over a DSM window, with
+    iterative outlier rejection.
 
     footprint_mask, if given, is a boolean array the same shape as elevation
     that's True only for DSM pixels actually under the segmented PV
@@ -449,10 +455,26 @@ def fit_roof_plane(elevation, transform, footprint_mask=None):
     which can include off-roof terrain the window's bounding box happens to
     cover -- e.g. a courtyard or street visible at the window's edges.
 
-    Returns (tilt_deg, azimuth_deg, (a, b, c)). Azimuth is the compass
-    direction the roof slopes DOWN toward (its aspect) -- same convention as
-    pvlib's surface_azimuth (0=N, 90=E, 180=S, 270=W), matching the
-    convention confirmed against the CA DG Stats data key in level3_fleet.py.
+    A real roof surface is locally smooth; a single DSM return more than
+    OUTLIER_RESIDUAL_M off the fitted plane is far more likely to be a
+    sensor artifact (a stray return off an antenna, vent, wire, or bird)
+    than an actual roof feature, so it's dropped and the plane refit --
+    up to MAX_OUTLIER_ITERATIONS times, or until nothing more is dropped.
+
+    But a handful of stray returns and "this cluster genuinely isn't one
+    flat plane" (e.g. a rougher roof, or a segmentation mask that spans more
+    than one physical roof) look the same point-by-point -- the only real
+    signal is how MUCH gets rejected. So this stops and keeps the last
+    accepted fit, rather than trimming further, if the next round would (a)
+    strip more than MAX_OUTLIER_FRACTION of the cluster's original points,
+    since a fit that only "works" by discarding a large chunk of real data
+    isn't trustworthy, or (b) leave fewer than 9 points, since a plane fit
+    on fewer than that isn't meaningful.
+
+    Returns (tilt_deg, azimuth_deg, (a, b, c), used_mask). used_mask is the
+    same shape as elevation, True only for the points in the final fit
+    (footprint pixels minus rejected outliers) -- useful for showing exactly
+    what was excluded and why.
     """
     rows, cols = np.indices(elevation.shape)
     xs, ys = rasterio.transform.xy(transform, rows.ravel(), cols.ravel())
@@ -461,12 +483,23 @@ def fit_roof_plane(elevation, transform, footprint_mask=None):
     valid = np.isfinite(zs) & (zs > -1000)  # DSM nodata is often a large negative sentinel
     if footprint_mask is not None:
         valid &= footprint_mask.ravel()
-    A = np.column_stack([xs[valid], ys[valid], np.ones(valid.sum())])
-    (a, b, c), *_ = np.linalg.lstsq(A, zs[valid], rcond=None)
+    n_initial = valid.sum()
+
+    for _ in range(MAX_OUTLIER_ITERATIONS):
+        A = np.column_stack([xs[valid], ys[valid], np.ones(valid.sum())])
+        (a, b, c), *_ = np.linalg.lstsq(A, zs[valid], rcond=None)
+        residual = zs - (a * xs + b * ys + c)
+        tightened = valid & (np.abs(residual) <= OUTLIER_RESIDUAL_M)
+        n_would_reject = n_initial - tightened.sum()
+        if tightened.sum() == valid.sum():
+            break  # converged
+        if n_would_reject > MAX_OUTLIER_FRACTION * n_initial or tightened.sum() < 9:
+            break  # this isn't a few artifacts -- keep the pre-trim fit instead of over-trimming
+        valid = tightened
 
     tilt_deg = np.degrees(np.arctan(np.hypot(a, b)))
     azimuth_deg = np.degrees(np.arctan2(-a, -b)) % 360
-    return tilt_deg, azimuth_deg, (a, b, c)
+    return tilt_deg, azimuth_deg, (a, b, c), valid.reshape(elevation.shape)
 
 
 def add_roof_geometry(arrays, image_transform, dsm_elevation, dsm_transform, image_crs, dsm_crs, margin_px=2):
@@ -528,14 +561,16 @@ def add_roof_geometry(arrays, image_transform, dsm_elevation, dsm_transform, ima
             cluster_mask = labels == label_id
             if cluster_mask.sum() < MIN_CLUSTER_PIXELS:
                 continue
-            tilt_deg, azimuth_deg, plane_coeffs = fit_roof_plane(window, window_transform, cluster_mask)
+            tilt_deg, azimuth_deg, plane_coeffs, fit_mask = fit_roof_plane(window, window_transform, cluster_mask)
             planes.append(
                 {
                     "tilt_deg": tilt_deg,
                     "azimuth_deg": azimuth_deg,
                     "plane_coeffs": plane_coeffs,
                     "mask": cluster_mask,
-                    "n_dsm_pixels": int(cluster_mask.sum()),
+                    "fit_mask": fit_mask,  # cluster pixels actually used, after outlier rejection
+                    "n_dsm_pixels": int(fit_mask.sum()),
+                    "n_outliers_rejected": int(cluster_mask.sum() - fit_mask.sum()),
                 }
             )
         planes.sort(key=lambda p: -p["n_dsm_pixels"])
@@ -672,11 +707,7 @@ def save_building_detail(array, output_path):
 
     elevation = array["dsm_window"]
     transform = array["dsm_window_transform"]
-    planes = array.get("roof_planes") or [
-        {"tilt_deg": array["tilt_deg"], "azimuth_deg": array["azimuth_deg"],
-         "plane_coeffs": array["plane_coeffs"], "mask": array["dsm_footprint_mask"],
-         "n_dsm_pixels": int(array["dsm_footprint_mask"].sum())}
-    ]
+    planes = array["roof_planes"]
 
     rows, cols = np.indices(elevation.shape)
     xs, ys = rasterio.transform.xy(transform, rows.ravel(), cols.ravel())
@@ -704,19 +735,30 @@ def save_building_detail(array, output_path):
 
     ax2 = fig.add_subplot(1, 2, 2, projection="3d")
     ax2.plot_surface(X, Y, Z, color="#c3c2b7", edgecolor="none", alpha=0.4)  # neutral terrain context
+    any_outliers = False
     for i, plane in enumerate(planes):
         color = cluster_colors[i % len(cluster_colors)]
         a_coef, b_coef, c_coef = plane["plane_coeffs"]
         plane_Z = (a_coef * xs + b_coef * ys + c_coef) - z0
-        used = plane["mask"] & valid
+        used = plane["fit_mask"] & valid
         ax2.scatter(
             X[used], Y[used], Z[used], color=color, edgecolors="#0b0b0b", linewidths=0.3, s=20, depthshade=False,
             label=f"Plane {i + 1}: tilt={plane['tilt_deg']:.1f}°, az={plane['azimuth_deg']:.0f}° ({plane['n_dsm_pixels']} px)",
         )
-        # only draw each fitted plane surface over its own cluster's local extent,
-        # not the whole window -- otherwise unrelated planes overplot each other
-        plane_Z_masked = np.where(plane["mask"], plane_Z, np.nan)
+        rejected = plane["mask"] & ~plane["fit_mask"] & valid
+        if rejected.any():
+            any_outliers = True
+            ax2.scatter(
+                X[rejected], Y[rejected], Z[rejected], color="#d03b3b", marker="x", s=30,
+                linewidths=1.2, depthshade=False, zorder=5,
+            )
+        # only draw each fitted plane surface over the pixels actually used in its
+        # fit (post outlier-rejection), not the whole window -- otherwise unrelated
+        # planes and rejected outliers overplot each other
+        plane_Z_masked = np.where(plane["fit_mask"], plane_Z, np.nan)
         ax2.plot_surface(X, Y, plane_Z_masked, color=color, alpha=0.3, edgecolor="none")
+    if any_outliers:
+        ax2.scatter([], [], [], color="#d03b3b", marker="x", label=f"Rejected as artifact (>{OUTLIER_RESIDUAL_M * 100:.0f}cm from fit)")
     ax2.legend(loc="upper left", fontsize=7, frameon=False)
     n_planes_note = f" -- {len(planes)} distinct roof planes found" if len(planes) > 1 else ""
     ax2.set_title(f"swissSURFACE3D DSM heights + fitted plane(s){n_planes_note}")
@@ -796,11 +838,12 @@ def main():
                     f"lat={a['centroid_lat']:.6f}  lon={a['centroid_lon']:.6f}  "
                     f"tilt={a['tilt_deg']:.1f}deg  azimuth={a['azimuth_deg']:.0f}deg"
                 )
-                if len(a["roof_planes"]) > 1:
+                if len(a["roof_planes"]) > 1 or a["roof_planes"][0]["n_outliers_rejected"] > 0:
                     for i, plane in enumerate(a["roof_planes"]):
+                        outlier_note = f"  ({plane['n_outliers_rejected']} outlier px rejected)" if plane["n_outliers_rejected"] else ""
                         print(
                             f"      plane {i + 1}: tilt={plane['tilt_deg']:.1f}deg  "
-                            f"azimuth={plane['azimuth_deg']:.0f}deg  n_dsm_px={plane['n_dsm_pixels']}"
+                            f"azimuth={plane['azimuth_deg']:.0f}deg  n_dsm_px={plane['n_dsm_pixels']}{outlier_note}"
                         )
 
         save_roof_geometry_windrose(arrays, "data/level3_cv_zurich_roof_geometry.png")
