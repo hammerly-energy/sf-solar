@@ -1054,6 +1054,113 @@ def save_outlier_check(array, image_transform, output_path, margin_m=3):
     print(f"Saved outlier check to {output_path}")
 
 
+def _shifted_overlap(a, b, dr, dc):
+    """The overlapping slices of a and b when b is shifted by (dr, dc)
+    relative to a (positive dr = b moved down, positive dc = b moved
+    right). No wraparound -- pixels that fall off the edge are just
+    dropped from the comparison, unlike np.roll."""
+    h, w = a.shape
+    ar0, ar1 = max(0, dr), min(h, h + dr)
+    ac0, ac1 = max(0, dc), min(w, w + dc)
+    br0, br1 = max(0, -dr), min(h, h - dr)
+    bc0, bc1 = max(0, -dc), min(w, w - dc)
+    return a[ar0:ar1, ac0:ac1], b[br0:br1, bc0:bc1]
+
+
+def _normalized_cross_correlation(a, b):
+    a, b = a.ravel(), b.ravel()
+    a, b = a - a.mean(), b - b.mean()
+    denom = np.sqrt((a**2).sum() * (b**2).sum())
+    return float((a * b).sum() / denom) if denom > 0 else 0.0
+
+
+def check_registration_offset(arrays, max_shift_px=4):
+    """Quantitative version of save_registration_check(): rather than
+    eyeballing one building, test whether SWISSIMAGE-derived masks and the
+    DSM are CONSISTENTLY offset from each other across every detected array.
+
+    For each array, computes two independent "edge strength" maps over the
+    same DSM pixel grid -- gradient magnitude of the DSM heights (real roof
+    edges are height jumps) and gradient magnitude of the rasterized mask
+    (the segmentation footprint's own boundary) -- then finds the pixel
+    shift that maximizes their normalized cross-correlation (NCC). NCC is
+    bounded in [-1, 1] and measures whether the two edge PATTERNS line up,
+    not just their magnitude, so unlike a raw gradient-magnitude search it
+    has a genuine interior peak instead of drifting toward whatever noisy
+    terrain happens to have more texture.
+
+    If most arrays agree on roughly the same non-zero shift, that's
+    evidence of a real, fixable spatial offset between the two datasets. If
+    the best shift is scattered across arrays (or clusters at zero), or the
+    correlation is weak everywhere, there's no reliable single offset to
+    correct for.
+    """
+    results = []
+    for a in arrays:
+        footprint_mask = a.get("dsm_footprint_mask")
+        dsm_window = a.get("dsm_window")
+        if footprint_mask is None or dsm_window is None or footprint_mask.sum() < 12:
+            continue
+
+        dgy, dgx = np.gradient(dsm_window)
+        dsm_edge = np.hypot(dgx, dgy)
+        mgy, mgx = np.gradient(footprint_mask.astype(float))
+        mask_edge = np.hypot(mgx, mgy)
+        if mask_edge.sum() == 0:
+            continue
+
+        best_shift, best_ncc, baseline_ncc = (0, 0), -1.0, None
+        for dr in range(-max_shift_px, max_shift_px + 1):
+            for dc in range(-max_shift_px, max_shift_px + 1):
+                d_ov, m_ov = _shifted_overlap(dsm_edge, mask_edge, dr, dc)
+                if d_ov.size < 20:  # too little overlap left to mean anything
+                    continue
+                ncc = _normalized_cross_correlation(d_ov, m_ov)
+                if dr == 0 and dc == 0:
+                    baseline_ncc = ncc
+                if ncc > best_ncc:
+                    best_ncc, best_shift = ncc, (dr, dc)
+
+        if baseline_ncc is None:
+            continue
+        results.append(
+            {
+                "label": f"{a['pv_area_m2']:.0f}m^2 @ ({a['centroid_lat']:.5f},{a['centroid_lon']:.5f})",
+                "best_shift_px": best_shift,
+                "best_ncc": best_ncc,
+                "baseline_ncc": baseline_ncc,
+            }
+        )
+
+    print(f"\nRegistration offset check across {len(results)} arrays (NCC, shift in DSM pixels, 0.5m each):")
+    for r in results:
+        flag = "" if r["best_shift_px"] == (0, 0) else "  <-- non-zero"
+        print(
+            f"  {r['label']:55s} best_shift={r['best_shift_px']}  "
+            f"NCC={r['best_ncc']:.2f} (vs {r['baseline_ncc']:.2f} at zero shift){flag}"
+        )
+
+    # a weak correlation even at its best (loose threshold: 0.15) means this array's
+    # edges are too noisy/ambiguous for the shift estimate to be trustworthy at all
+    confident = [r for r in results if r["best_ncc"] >= 0.15]
+    print(f"\n{len(confident)}/{len(results)} arrays had a strong enough edge match (NCC >= 0.15) to trust their shift estimate.")
+    if confident:
+        shift_counts = {}
+        for r in confident:
+            shift_counts[r["best_shift_px"]] = shift_counts.get(r["best_shift_px"], 0) + 1
+        mode_shift, mode_count = max(shift_counts.items(), key=lambda kv: kv[1])
+        print(
+            f"Most common best-shift among those: {mode_shift} in {mode_count}/{len(confident)}. "
+            + (
+                "Zero (or near-zero) shift dominates -- no evidence of a consistent spatial offset."
+                if mode_shift == (0, 0)
+                else "A non-zero shift dominates -- this looks like a real registration offset worth correcting."
+                if mode_count / len(confident) > 0.5
+                else "No shift dominates even among the confident results -- still no reliable evidence of a fixed offset."
+            )
+        )
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "smoke"
     print(f"Device: {DEVICE}, mode: {mode}")
@@ -1145,6 +1252,8 @@ def main():
 
             most_outliers = max(fitted, key=lambda a: sum(p["n_outliers_rejected"] for p in a["roof_planes"]))
             save_outlier_check(most_outliers, transform, f"data/level3_cv_{mode}_outlier_check.png")
+
+            check_registration_offset(fitted)
 
 
 if __name__ == "__main__":
