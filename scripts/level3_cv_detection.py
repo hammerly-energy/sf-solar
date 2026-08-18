@@ -542,6 +542,63 @@ def fit_roof_plane(elevation, transform, footprint_mask=None):
     return tilt_deg, azimuth_deg, (a, b, c), valid.reshape(elevation.shape)
 
 
+def fit_group_planes(window, window_transform, group_mask, min_pixels):
+    """Split one spatially-connected group of DSM pixels into multiple plane
+    facets, where the group doesn't sit on a single plane -- e.g. several
+    individually-tilted rack-mounted rows that touch each other in the mask.
+
+    Sequential-plane-peeling, the same idea as RANSAC-style multi-plane
+    segmentation: fit one plane (fit_roof_plane already does its own
+    within-plane outlier rejection), keep it, then look at whatever's left
+    over. If that leftover still contains a spatially-connected group of at
+    least min_pixels, it's not noise -- it's probably a whole separate
+    facet -- so queue it up and fit it too. Repeats until nothing sizeable
+    is left.
+
+    Returns a list of facet dicts (tilt_deg, azimuth_deg, plane_coeffs,
+    fit_mask, n_dsm_pixels), largest first. Only the primary (largest)
+    facet carries n_outliers_rejected / outlier_mask -- points that ended up
+    in a sibling facet aren't outliers, they're just a different plane, and
+    only points nothing ever claimed count as genuine unexplained leftovers.
+    """
+    from scipy import ndimage
+
+    facets = []
+    queue = [group_mask]
+    while queue:
+        candidate = queue.pop(0)
+        if candidate.sum() < min_pixels:
+            continue
+        tilt_deg, azimuth_deg, plane_coeffs, fit_mask = fit_roof_plane(window, window_transform, candidate)
+        if fit_mask.sum() < min_pixels:
+            continue
+        facets.append(
+            {"tilt_deg": tilt_deg, "azimuth_deg": azimuth_deg, "plane_coeffs": plane_coeffs, "fit_mask": fit_mask}
+        )
+        leftover = candidate & ~fit_mask
+        if leftover.sum() >= min_pixels:
+            sub_labels, n_sub = ndimage.label(leftover, structure=np.ones((3, 3)))
+            for label_id in range(1, n_sub + 1):
+                sub_mask = sub_labels == label_id
+                if sub_mask.sum() >= min_pixels:
+                    queue.append(sub_mask)
+
+    if not facets:
+        return []
+
+    claimed = np.zeros_like(group_mask)
+    for f in facets:
+        claimed |= f["fit_mask"]
+    outlier_mask = group_mask & ~claimed
+
+    facets.sort(key=lambda f: -f["fit_mask"].sum())
+    for i, f in enumerate(facets):
+        f["n_dsm_pixels"] = int(f["fit_mask"].sum())
+        f["outlier_mask"] = outlier_mask if i == 0 else np.zeros_like(group_mask)
+        f["n_outliers_rejected"] = int(outlier_mask.sum()) if i == 0 else 0
+    return facets
+
+
 def add_roof_geometry(arrays, image_transform, dsm_elevation, dsm_transform, image_crs, dsm_crs, margin_px=2):
     """For each detected array, fit a roof plane to the DSM pixels under its
     segmented footprint and attach tilt/azimuth. The footprint's DSM pixels
@@ -589,11 +646,18 @@ def add_roof_geometry(arrays, image_transform, dsm_elevation, dsm_transform, ima
         footprint_mask[local_rows[in_bounds], local_cols[in_bounds]] = True
 
         # a single detected array's footprint can span more than one physical
-        # roof plane -- either genuinely (two roof faces at different pitches)
-        # or spuriously (a disconnected false-positive blob elsewhere in the
-        # tile, e.g. street markings the classifier mistook for panels). Fit
-        # a separate plane per spatially-connected cluster of DSM pixels
-        # rather than one plane across all of them.
+        # roof plane -- either genuinely (two roof faces at different pitches,
+        # or several individually-tilted rack-mounted rows sitting close
+        # together) or spuriously (a disconnected false-positive blob
+        # elsewhere in the tile, e.g. street markings the classifier mistook
+        # for panels). Connected-component labeling alone only catches the
+        # spurious case -- it splits by adjacency, not by whether pixels
+        # actually sit on the same plane, so several touching tilted rows
+        # still come out as one blob. fit_group_planes() (below) handles
+        # that: within each spatially-connected group, it keeps peeling off
+        # the best-fitting plane and re-clustering whatever's left, so e.g.
+        # four adjacent tilted panel rows become four separate plane fits
+        # instead of one meaningless average.
         MIN_CLUSTER_PIXELS = 9
         labels, n_clusters = ndimage.label(footprint_mask, structure=np.ones((3, 3)))
         planes = []
@@ -601,18 +665,7 @@ def add_roof_geometry(arrays, image_transform, dsm_elevation, dsm_transform, ima
             cluster_mask = labels == label_id
             if cluster_mask.sum() < MIN_CLUSTER_PIXELS:
                 continue
-            tilt_deg, azimuth_deg, plane_coeffs, fit_mask = fit_roof_plane(window, window_transform, cluster_mask)
-            planes.append(
-                {
-                    "tilt_deg": tilt_deg,
-                    "azimuth_deg": azimuth_deg,
-                    "plane_coeffs": plane_coeffs,
-                    "mask": cluster_mask,
-                    "fit_mask": fit_mask,  # cluster pixels actually used, after outlier rejection
-                    "n_dsm_pixels": int(fit_mask.sum()),
-                    "n_outliers_rejected": int(cluster_mask.sum() - fit_mask.sum()),
-                }
-            )
+            planes.extend(fit_group_planes(window, window_transform, cluster_mask, MIN_CLUSTER_PIXELS))
         planes.sort(key=lambda p: -p["n_dsm_pixels"])
 
         if not planes:  # every cluster too small to fit a plane meaningfully
@@ -809,7 +862,7 @@ def save_building_detail(array, output_path):
             X[used], Y[used], Z[used], color=color, edgecolors="#0b0b0b", linewidths=0.3, s=20, depthshade=False,
             label=f"Plane {i + 1}: tilt={plane['tilt_deg']:.1f}°, az={plane['azimuth_deg']:.0f}° ({plane['n_dsm_pixels']} px)",
         )
-        rejected = plane["mask"] & ~plane["fit_mask"] & valid
+        rejected = plane["outlier_mask"] & valid
         if rejected.any():
             any_outliers = True
             ax2.scatter(
@@ -914,6 +967,93 @@ def save_registration_check(array, image_transform, output_path, margin_m=3):
     print(f"Saved registration check to {output_path}")
 
 
+def save_outlier_check(array, image_transform, output_path, margin_m=3):
+    """Show exactly where fit_roof_plane()'s rejected outlier points sit, on
+    both the orthophoto and the raw DSM, in the same shared real-world
+    coordinates -- so it's checkable by eye whether a rejected point
+    corresponds to something real and visible (a chimney, vent, antenna,
+    overhanging tree) or looks like plain sensor noise.
+    """
+    import matplotlib.colors as mcolors
+    import matplotlib.pyplot as plt
+
+    planes = array.get("roof_planes")
+    if not planes:
+        print("Selected array has no fitted roof planes -- skipping outlier check.")
+        return
+
+    dsm_window = array["dsm_window"]
+    dsm_transform = array["dsm_window_transform"]
+    rejected_mask = np.zeros(dsm_window.shape, dtype=bool)
+    for plane in planes:
+        rejected_mask |= plane["outlier_mask"]
+    n_rejected = int(rejected_mask.sum())
+    if n_rejected == 0:
+        print("Selected array had zero rejected outliers -- skipping outlier check.")
+        return
+
+    tile_transform = rasterio.windows.transform(
+        rasterio.windows.Window(array["x0"], array["y0"], TILE_PX, TILE_PX), image_transform
+    )
+
+    dsm_left, dsm_bottom, dsm_right, dsm_top = rasterio.transform.array_bounds(*dsm_window.shape, dsm_transform)
+    crop_left, crop_right = dsm_left - margin_m, dsm_right + margin_m
+    crop_bottom, crop_top = dsm_bottom - margin_m, dsm_top + margin_m
+
+    rows, cols = rasterio.transform.rowcol(tile_transform, [crop_left, crop_right], [crop_top, crop_bottom])
+    r0, r1 = sorted((max(int(rows[0]), 0), min(int(rows[1]), TILE_PX)))
+    c0, c1 = sorted((max(int(cols[0]), 0), min(int(cols[1]), TILE_PX)))
+    rgb_crop = np.transpose(array["pixels"][:, r0:r1, c0:c1], (1, 2, 0))
+    mask_crop = array["mask"][r0:r1, c0:c1]
+    rgb_crop_transform = rasterio.windows.transform(rasterio.windows.Window(c0, r0, c1 - c0, r1 - r0), tile_transform)
+    rgb_bounds = rasterio.transform.array_bounds(r1 - r0, c1 - c0, rgb_crop_transform)
+
+    ox, oy = crop_left, crop_bottom
+
+    def to_extent(bounds):
+        left, bottom, right, top = bounds
+        return [left - ox, right - ox, bottom - oy, top - oy]
+
+    rej_rows, rej_cols = np.nonzero(rejected_mask)
+    rej_xs, rej_ys = rasterio.transform.xy(dsm_transform, rej_rows, rej_cols)
+    rej_x_local = np.array(rej_xs) - ox
+    rej_y_local = np.array(rej_ys) - oy
+
+    blue_ramp = ["#cde2fb", "#9ec5f4", "#5598e7", "#256abf", "#0d366b"]
+    cmap = mcolors.LinearSegmentedColormap.from_list("elevation_blue", blue_ramp)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+
+    ax1.imshow(rgb_crop, extent=to_extent(rgb_bounds), origin="upper")
+    ax1.contour(mask_crop.astype(float), levels=[0.5], extent=to_extent(rgb_bounds), origin="upper", colors="#eda100", linewidths=1.5)
+    ax1.scatter(rej_x_local, rej_y_local, color="#d03b3b", marker="x", s=60, linewidths=2, zorder=5, label="Rejected outlier")
+    ax1.set_title("SWISSIMAGE orthophoto\n+ rejected outlier locations")
+    ax1.set_xlabel("East-West (m)")
+    ax1.set_ylabel("North-South (m)")
+    ax1.legend(loc="upper right", fontsize=8, frameon=True)
+
+    im = ax2.imshow(
+        dsm_window, cmap=cmap, extent=to_extent((dsm_left, dsm_bottom, dsm_right, dsm_top)), origin="upper"
+    )
+    ax2.contour(
+        array["dsm_footprint_mask"].astype(float), levels=[0.5],
+        extent=to_extent((dsm_left, dsm_bottom, dsm_right, dsm_top)), origin="upper", colors="#eda100", linewidths=1.5,
+    )
+    ax2.scatter(rej_x_local, rej_y_local, facecolors="none", edgecolors="#d03b3b", marker="o", s=100, linewidths=2, zorder=5)
+    ax2.set_title(f"swissSURFACE3D DSM height\n+ {n_rejected} rejected outlier px (>{OUTLIER_RESIDUAL_M * 100:.0f}cm from fit)")
+    ax2.set_xlabel("East-West (m)")
+    fig.colorbar(im, ax=ax2, label="Height (m)", shrink=0.8)
+
+    for ax in (ax1, ax2):
+        ax.set_xlim(crop_left - ox, crop_right - ox)
+        ax.set_ylim(crop_bottom - oy, crop_top - oy)
+
+    fig.suptitle("Rejected outliers -- same points, orthophoto + LiDAR height, shared coordinates")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    print(f"Saved outlier check to {output_path}")
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "smoke"
     print(f"Device: {DEVICE}, mode: {mode}")
@@ -1002,6 +1142,9 @@ def main():
             best = max(fitted, key=lambda a: a["p_pv"])
             save_building_detail(best, f"data/level3_cv_{mode}_building_detail.png")
             save_registration_check(best, transform, f"data/level3_cv_{mode}_registration_check.png")
+
+            most_outliers = max(fitted, key=lambda a: sum(p["n_outliers_rejected"] for p in a["roof_planes"]))
+            save_outlier_check(most_outliers, transform, f"data/level3_cv_{mode}_outlier_check.png")
 
 
 if __name__ == "__main__":
