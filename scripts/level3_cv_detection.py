@@ -8,16 +8,23 @@ roof plane (tilt/azimuth) from LiDAR. Three stages: classify (ViT-MAE-large
 + LoRA) -> segment (SegFormer) -> fit a plane to the segmented footprint's
 DSM pixels.
 
-Three modes (first CLI arg):
-  zurich  -- Wiedikon, Zurich. WORKING. SWISSIMAGE (10cm/px) + swissSURFACE3D
-             DSM (0.5m/px), both openly licensed. Classifier clears its own
-             0.5 decision threshold here; full pipeline runs end-to-end,
-             including DSM mosaicking across all tiles covering the bbox.
-  smoke   -- SF Richmond (94118/94121), centered on a permit-verified
+Four modes (first CLI arg):
+  zurich     -- Wiedikon, Zurich. WORKING, but turned out almost entirely
+             near-flat commercial/industrial roofs -- not much of a stress
+             test for the plane-fitting code. SWISSIMAGE (10cm/px) +
+             swissSURFACE3D DSM (0.5m/px), both openly licensed. Classifier
+             clears its own 0.5 decision threshold here; full pipeline runs
+             end-to-end, including DSM mosaicking across all tiles covering
+             the bbox.
+  altstetten -- Altstetten, Zurich (Kreis 9). Picked via OpenStreetMap's
+             Overpass API (real generator:source=solar tags, not a guess) to
+             find a residential area with pitched roofs and confirmed real
+             solar, as a contrast to Wiedikon's flat roofs.
+  smoke      -- SF Richmond (94118/94121), centered on a permit-verified
              address. KNOWN BROKEN: NAIP is only 0.6m/px vs the ~0.24m/px
              (Google Maps zoom>=19) the model expects; every tile scored
              near zero even at a real positive location.
-  control -- SF Sunset Reservoir solar farm (positive control, ~24,000
+  control    -- SF Sunset Reservoir solar farm (positive control, ~24,000
              panels, unmistakable in the imagery). KNOWN BROKEN for the same
              resolution reason -- max score 0.10 even here, proving the SF
              failure is resolution (and/or ground-mount-vs-rooftop domain
@@ -216,8 +223,44 @@ def get_zurich_bbox():
     return bbox, (center_lon, center_lat)
 
 
+# Wiedikon turned out to be almost entirely near-flat commercial/industrial
+# roofs -- not a useful stress test for the plane-fitting code, which needs
+# genuine pitch variation to be worth anything. Altstetten (a former village
+# annexed into the city, Kreis 9) was picked instead of guessing: queried
+# OpenStreetMap's Overpass API for real generator:source=solar tags across
+# the whole city. First pass just took the rawest point-density hotspot,
+# which turned out to be ~90 individually-mapped panel nodes on ONE flat
+# industrial/service roof (a false signal -- one enthusiastic OSM mapper,
+# not neighborhood-wide adoption), landing the bbox mostly on a sports
+# field and a highway. Redone properly: queried actual building footprints
+# to find genuinely dense small-building residential blocks, then
+# cross-referenced those against nearby solar-point density to find a
+# cluster with both -- 95 distinct buildings and 91 nearby confirmed solar
+# installations within 300m, a real residential grid, not a guess.
+ZURICH_ALTSTETTEN = (8.4747, 47.4012)
+
+
+def get_zurich_altstetten_bbox():
+    center_lon, center_lat = ZURICH_ALTSTETTEN
+    radius_m = 300
+    dlat = radius_m / 111_320
+    dlon = radius_m / (111_320 * np.cos(np.radians(center_lat)))
+    bbox = [center_lon - dlon, center_lat - dlat, center_lon + dlon, center_lat + dlat]
+    print(f"Zurich test centered on Altstetten at {center_lat:.6f}, {center_lon:.6f}")
+    print(f"bbox: {bbox}")
+    return bbox, (center_lon, center_lat)
+
+
 def fetch_swissimage_chip(bbox):
     """Read the SWISSIMAGE 10cm window covering bbox, resampled to TARGET_MPP.
+
+    Mosaics all SWISSIMAGE tiles covering the bbox -- a bbox can straddle a
+    tile boundary (SWISSIMAGE tiles are ~1km), and reading only one tile
+    would silently truncate the fetch to whatever fraction of the bbox that
+    tile happens to cover. fetch_dsm_chip() had this exact bug; see CLAUDE.md.
+    Where tiles overlap, rasterio.merge keeps the first dataset's pixels, so
+    sorting hrefs newest-first preserves the original "prefer most recent
+    acquisition" intent.
 
     Attribution per swisstopo terms of use: (C) swisstopo.
     """
@@ -227,17 +270,14 @@ def fetch_swissimage_chip(bbox):
     )
     resp.raise_for_status()
     items = resp.json()["features"]
-    # prefer the most recent acquisition covering this bbox
     items.sort(key=lambda i: i["properties"]["datetime"], reverse=True)
-    item = items[0]
-    href = next(v["href"] for k, v in item["assets"].items() if k.endswith("_0.1_2056.tif"))
-    print(f"Using SWISSIMAGE item: {item['id']}")
+    hrefs = [next(v["href"] for k, v in item["assets"].items() if k.endswith("_0.1_2056.tif")) for item in items]
+    print(f"Mosaicking {len(hrefs)} SWISSIMAGE tile(s), newest: {items[0]['id']}")
 
-    with rasterio.open(href) as src:
-        window = from_bounds(*rasterio.warp.transform_bounds("EPSG:4326", src.crs, *bbox), src.transform)
-        data = src.read([1, 2, 3], window=window)
-        window_transform = src.window_transform(window)
+    with rasterio.open(hrefs[0]) as src:
         src_crs = src.crs
+    merge_bounds = rasterio.warp.transform_bounds("EPSG:4326", src_crs, *bbox)
+    data, window_transform = merge_rasters(hrefs, bounds=merge_bounds, indexes=[1, 2, 3])
 
     scale = SWISSIMAGE_NATIVE_MPP / TARGET_MPP  # ~0.42 -- downsampling, not up
     new_height = int(data.shape[1] * scale)
@@ -591,7 +631,7 @@ def add_roof_geometry(arrays, image_transform, dsm_elevation, dsm_transform, ima
         a["dsm_footprint_mask"] = footprint_mask
 
 
-def save_roof_geometry_windrose(arrays, output_path):
+def save_roof_geometry_windrose(arrays, output_path, location_label="Wiedikon, Zurich"):
     """Polar plot of fitted roof geometry: azimuth as compass angle, tilt as
     radius, marker size by panel area, color by classifier confidence.
 
@@ -622,17 +662,41 @@ def save_roof_geometry_windrose(arrays, output_path):
 
     # Labels sharing near-identical azimuth (common near the center, where several
     # roofs happen to face the same way) would overlap if placed at their raw
-    # angle. Sort by azimuth and push any label less than MIN_GAP_DEG from the
-    # previous one further around the ring -- a leader line still points each
-    # label back to its true marker, so nothing is misrepresented, just decluttered.
-    MIN_GAP_DEG = 16
-    order = np.argsort(azimuth_deg)
-    label_azimuth_deg = azimuth_deg[order].astype(float).copy()
-    for i in range(1, len(label_azimuth_deg)):
-        if label_azimuth_deg[i] - label_azimuth_deg[i - 1] < MIN_GAP_DEG:
-            label_azimuth_deg[i] = label_azimuth_deg[i - 1] + MIN_GAP_DEG
-    unsort = np.argsort(order)
-    label_azimuth_deg = label_azimuth_deg[unsort]  # back to original point order
+    # angle. Push any label less than MIN_GAP_DEG from the previous one (going
+    # around the circle) further along the ring -- a leader line still points
+    # each label back to its true marker, so nothing is misrepresented, just
+    # decluttered. This is circular, not linear: with enough points, naively
+    # pushing forward from azimuth 0 can walk past 360 deg and collide with
+    # wherever it started. So instead start the walk right after the single
+    # largest natural gap between points -- the one place nothing needs to
+    # wrap around -- and shrink the gap if there are too many points to fit
+    # MIN_GAP_DEG apart at all.
+    n = len(azimuth_deg)
+    min_gap_deg = min(16, 340 / n)
+    sorted_az = np.sort(azimuth_deg)
+    circular_gaps = np.diff(np.concatenate([sorted_az, [sorted_az[0] + 360]]))
+    start_idx = np.argmax(circular_gaps)
+    walk_order = np.roll(np.argsort(azimuth_deg), -1 - start_idx)  # start just after the biggest gap
+
+    # unwrap the RAW azimuths along the walk first (they cross the 360->0
+    # boundary at most once, right where the walk started) -- keeping this
+    # separate from the push step below matters: comparing each point's raw
+    # azimuth to the previous point's already-pushed label position would
+    # misfire (a raw angle can easily be "less than" an inflated label without
+    # any real wraparound having happened), which is what produced the
+    # original bug -- labels landing back on top of earlier, unrelated ones.
+    unwrapped_raw = azimuth_deg[walk_order].astype(float).copy()
+    wrap_at = np.where(np.diff(unwrapped_raw) < 0)[0]
+    if wrap_at.size:
+        unwrapped_raw[wrap_at[0] + 1 :] += 360
+
+    label_walk = np.empty(n)
+    label_walk[0] = unwrapped_raw[0]
+    for i in range(1, n):
+        label_walk[i] = max(unwrapped_raw[i], label_walk[i - 1] + min_gap_deg)
+
+    label_azimuth_deg = np.empty(n)
+    label_azimuth_deg[walk_order] = label_walk
 
     theta = np.radians(azimuth_deg)
     label_theta = np.radians(label_azimuth_deg)
@@ -645,7 +709,7 @@ def save_roof_geometry_windrose(arrays, output_path):
     ax.set_ylim(0, r_max)
     ax.set_ylabel("")
     ax.set_title(
-        "Fitted roof geometry -- Wiedikon, Zurich\n(azimuth = compass direction, radius = tilt, from swissSURFACE3D LiDAR)",
+        f"Fitted roof geometry -- {location_label}\n(azimuth = compass direction, radius = tilt, from swissSURFACE3D LiDAR)",
         pad=28,
     )
 
@@ -854,6 +918,8 @@ def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "smoke"
     print(f"Device: {DEVICE}, mode: {mode}")
 
+    ZURICH_MODES = {"zurich", "altstetten"}
+
     if mode == "control":
         bbox, target_lonlat = get_control_test_bbox()
         output_path = "data/level3_cv_control_test_tiles.png"
@@ -862,12 +928,16 @@ def main():
         bbox, target_lonlat = get_zurich_bbox()
         output_path = "data/level3_cv_zurich_test_tiles.png"
         target_label = "bbox center"
+    elif mode == "altstetten":
+        bbox, target_lonlat = get_zurich_altstetten_bbox()
+        output_path = "data/level3_cv_altstetten_test_tiles.png"
+        target_label = "bbox center"
     else:
         bbox, target_lonlat = get_smoke_test_bbox()
         output_path = "data/level3_cv_smoke_test_tiles.png"
         target_label = "permit addr"
 
-    if mode == "zurich":
+    if mode in ZURICH_MODES:
         image, transform, crs = fetch_swissimage_chip(bbox)
         title = "SWISSIMAGE tiles fed to DeepSolar-3M classifier (downsampled 0.1m/px -> 0.24m/px)"
     else:
@@ -892,10 +962,10 @@ def main():
     for r in results[:10]:
         print(f"  p_pv={r['p_pv']:.3f}  lat={r['center_lat']:.6f}  lon={r['center_lon']:.6f}")
 
-    if mode == "zurich":
+    if mode in ZURICH_MODES:
         print("\nRunning segmentation on plausible-PV tiles...")
         arrays = find_pv_arrays(tiles, results, transform, crs, threshold=0.2)
-        save_segmentation_overlays(arrays, "data/level3_cv_zurich_segmentation.png")
+        save_segmentation_overlays(arrays, f"data/level3_cv_{mode}_segmentation.png")
 
         print("\nFetching swissSURFACE3D DSM for roof-plane fitting...")
         dsm_elevation, dsm_transform, dsm_crs = fetch_dsm_chip(bbox)
@@ -924,13 +994,14 @@ def main():
                             f"azimuth={plane['azimuth_deg']:.0f}deg  n_dsm_px={plane['n_dsm_pixels']}{outlier_note}"
                         )
 
-        save_roof_geometry_windrose(arrays, "data/level3_cv_zurich_roof_geometry.png")
+        location_label = "Altstetten, Zurich" if mode == "altstetten" else "Wiedikon, Zurich"
+        save_roof_geometry_windrose(arrays, f"data/level3_cv_{mode}_roof_geometry.png", location_label)
 
         fitted = [a for a in arrays if a.get("tilt_deg") is not None]
         if fitted:
             best = max(fitted, key=lambda a: a["p_pv"])
-            save_building_detail(best, "data/level3_cv_zurich_building_detail.png")
-            save_registration_check(best, transform, "data/level3_cv_zurich_registration_check.png")
+            save_building_detail(best, f"data/level3_cv_{mode}_building_detail.png")
+            save_registration_check(best, transform, f"data/level3_cv_{mode}_registration_check.png")
 
 
 if __name__ == "__main__":
