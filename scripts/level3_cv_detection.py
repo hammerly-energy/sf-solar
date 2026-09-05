@@ -426,6 +426,39 @@ def find_pv_arrays(tiles, results, transform, crs, threshold=0.2):
     return arrays
 
 
+def save_detection_cache(arrays, image_transform, image_crs, output_path):
+    """Dump every detection (segmentation mask + geometry) to a .npz.
+
+    The full pipeline takes ~10 minutes, mostly model inference. Anything that
+    wants to re-examine the detections afterwards -- a visual audit, a
+    threshold sweep, a different plot -- should read this cache instead of
+    re-running inference. Masks are tile-local; y0/x0 place each tile in the
+    full image, and image_transform maps full-image pixels to CRS coords.
+    """
+    payload = {
+        "transform": np.array(image_transform.to_gdal(), dtype=float),
+        "crs": np.array(str(image_crs)),
+        "n_arrays": np.array(len(arrays)),
+    }
+    for i, a in enumerate(arrays):
+        payload[f"mask_{i}"] = a["mask"].astype(np.uint8)
+        payload[f"meta_{i}"] = np.array(
+            [
+                a["p_pv"],
+                a["y0"],
+                a["x0"],
+                a["pv_area_m2"],
+                a["centroid_lat"] if a["centroid_lat"] is not None else np.nan,
+                a["centroid_lon"] if a["centroid_lon"] is not None else np.nan,
+                a.get("tilt_deg") if a.get("tilt_deg") is not None else np.nan,
+                a.get("azimuth_deg") if a.get("azimuth_deg") is not None else np.nan,
+            ],
+            dtype=float,
+        )
+    np.savez_compressed(output_path, **payload)
+    print(f"Saved detection cache ({len(arrays)} arrays) to {output_path}")
+
+
 def save_segmentation_overlays(arrays, output_path):
     import matplotlib.pyplot as plt
 
@@ -462,12 +495,19 @@ def fetch_dsm_chip(bbox):
     )
     resp.raise_for_status()
     items = resp.json()["features"]
+    # Every tile exists in BOTH a 2018 and a 2024 acquisition, and the API
+    # returns 2018 first. rasterio.merge keeps the FIRST dataset's pixels
+    # where tiles overlap, so without this sort we'd silently fit planes to
+    # 2018 elevation under 2025 imagery -- any array installed since 2018
+    # would be fitted to the bare roof as it was before the panels existed.
+    items.sort(key=lambda i: i["properties"]["datetime"], reverse=True)
     hrefs = []
     for item in items:
         href = next((v["href"] for k, v in item["assets"].items() if k.endswith(".tif")), None)
         if href:
             hrefs.append(href)
-    print(f"DSM tiles covering bbox: {len(hrefs)}")
+    years = sorted({i["properties"]["datetime"][:4] for i in items}, reverse=True)
+    print(f"DSM tiles covering bbox: {len(hrefs)} (acquisitions available: {', '.join(years)}; using newest first)")
 
     # bbox commonly spans several DSM tiles (they're smaller than the
     # SWISSIMAGE tiles) -- mosaic all of them, then crop to bbox, so no
@@ -1240,6 +1280,8 @@ def main():
                             f"      plane {i + 1}: tilt={plane['tilt_deg']:.1f}deg  "
                             f"azimuth={plane['azimuth_deg']:.0f}deg  n_dsm_px={plane['n_dsm_pixels']}{outlier_note}"
                         )
+
+        save_detection_cache(arrays, transform, crs, f"data/level3_cv_{mode}_detections.npz")
 
         location_label = "Altstetten, Zurich" if mode == "altstetten" else "Wiedikon, Zurich"
         save_roof_geometry_windrose(arrays, f"data/level3_cv_{mode}_roof_geometry.png", location_label)
