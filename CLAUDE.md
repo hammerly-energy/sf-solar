@@ -263,11 +263,33 @@ exists to derive, from imagery SF does not have, a quantity SF already knows. It
 it surfaced the DSM date bug and a lot about the data — but it is **not on the critical path** to a
 citywide MW curve.
 
-Before any further investment here, do the one-hour pvlib sensitivity table: citywide MW error per 10°
-of tilt error and per 20° of azimuth error, at 09:00 / 12:00 / 17:00. For an instantaneous nowcast
-azimuth matters far more than annual-energy intuition suggests (an east- vs west-facing array at 20°
-tilt differs by 2–5× at 08:00 and 17:00). That number decides whether this branch deserves more effort
-than the capacity branch.
+**The sensitivity table has now been run** — `scripts/level3_geometry_sensitivity.py`, which sweeps
+tilt and azimuth error over the real fleet through pvlib and sums to a citywide MW curve. All four
+sanity checks pass (peak clear-sky GHI 967 W/m², peak AC 77% of nameplate DC, exactly zero at night,
+and the vectorised transposition matches a per-geometry loop to 2.3e-13 MW).
+
+**Answer: the branch cannot pay for itself.** Even in an absurd worst case where the entire 4.1%
+gap-filled slice is simultaneously off by 20° in tilt *and* flipped 180° in azimuth, the citywide
+error is **−0.73% at summer noon and −3.35% on a winter morning**. That is the ceiling on what
+perfect geometry measurement could buy, and the realistic figure is far smaller.
+
+Other findings worth keeping:
+
+- **Systematic bias matters enormously more than random scatter.** A +20° tilt *bias* costs +48.6% at
+  winter 09:00; +20° of independent per-system *scatter* costs +13.2%. Azimuth: ±60° bias reaches ±24%
+  at winter 09:00, while σ=60° scatter reaches only −6.4%. Errors that cancel across 13,485 systems
+  are cheap; errors that point the same way are not. **The CV pipeline's measured error is the
+  expensive kind** — a size-dependent tilt bias (ρ = −0.705), not noise.
+- **Annual energy is a bad proxy for a nowcast.** ±20° of tilt bias moves annual clear-sky energy by
+  only −3.2%/+8.3%, but moves instantaneous winter-morning MW by −14.8%/+48.6%. Summer *noon* is
+  almost completely insensitive to tilt (0.2% at ±20°) — the hours that matter are the shoulders.
+- **Azimuth error flips sign between morning and evening** (a 60° eastward bias is +12.0% at 09:00 and
+  −9.6% at 17:00 in summer), so it partly cancels in a daily total while badly distorting the shape.
+- **42.7% of SF capacity (34.6 MW) is recorded flat, and 30.0 MW of that stores azimuth=0 as a
+  placeholder, not a bearing.** Any error model that tilts those systems must not let them inherit
+  due north, or it will overstate the sensitivity badly. `apply_error()` assigns the tilted fleet's
+  capacity-weighted median azimuth (180°, due south) instead; `FLAT_STAYS_FLAT` toggles the
+  alternative.
 
 Full three-way pipeline comparison (current / +point cloud / +normal segmentation) with all of today's
 measurements: https://claude.ai/code/artifact/c259959a-0425-451c-a7be-3dde0e962d5c
