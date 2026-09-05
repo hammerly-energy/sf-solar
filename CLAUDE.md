@@ -120,7 +120,11 @@ Explored going beyond ZIP-code fleet data to real per-building locations + LiDAR
 - **Second test area added: Altstetten (`altstetten` mode).** Wiedikon turned out almost entirely flat commercial/industrial roofs, not much of a stress test. Picking a second area properly (not guessing) took three tries:
   1. First pass: raw density of OpenStreetMap `generator:source=solar` tags across the city. The densest hotspot turned out to be ~90 individually-mapped panel nodes on **one** flat service building — an OSM mapping artifact (one enthusiastic mapper), not neighborhood-wide adoption. Landed the bbox mostly on a sports field and a highway.
   2. Second pass: cross-referenced actual building-footprint density against nearby solar-point density, to distinguish "many small buildings" from "one heavily-mapped roof." Found a much better cell (95 distinct buildings + 91 solar points within 300m) — but it turned out to center on **Bändlistrasse, next to the ARA Werdhölzli wastewater treatment plant**, not real houses. The high-confidence detections (13 arrays, 0.8–0.99 confidence, genuine tilt variety: 4.3°, 9.3°, 9.6°) are almost all on treatment-plant buildings; the actual residential blocks visible in the same frame scored ~0.001–0.03, essentially nothing.
-  3. Decision (confirmed with Christian): kept this area anyway. It genuinely delivers what the stress test needed — real pitch variety and plenty of confirmed solar — even though the source is a utility complex rather than single-family homes. `ZURICH_ALTSTETTEN = (8.4747, 47.4012)` in `scripts/level3_cv_detection.py` has the full story in a code comment.
+  3. Decision (confirmed with Christian): kept this area anyway. **NOTE (2026-09-05): the "real pitch
+     variety" justification has since been refuted** — see "Cross-examination findings" below. After the
+     DSM date fix, all 13 Altstetten detections read 0.0–1.4°, and the two apparent exceptions (5.7°,
+     10.2°) turned out to be tile fragments whose contiguous other halves read 0.21° and 1.06°. The area
+     still has plenty of confirmed real solar; it does not have the tilt variety it was chosen for. `ZURICH_ALTSTETTEN = (8.4747, 47.4012)` in `scripts/level3_cv_detection.py` has the full story in a code comment.
   - **Two more bugs found while chasing this down, both fixed:**
     - `fetch_swissimage_chip()` had the *exact same* single-tile bug `fetch_dsm_chip()` had before its earlier fix — only reading `items[0]` instead of mosaicking. Altstetten's bbox happened to straddle a SWISSIMAGE tile boundary (Wiedikon's didn't), silently truncating the fetched image to a fraction of the requested width and crashing the tile grid layout. Fixed the same way: `rasterio.merge.merge()` over all covering tiles, newest-first so overlaps still prefer the most recent acquisition.
     - The wind-rose's label-decluttering (added for Wiedikon) had a latent bug that only showed up with more detected arrays: it unwrapped azimuths past 360° by comparing each point's raw angle to the *previous label's already-pushed* position instead of to the *previous point's raw* position, so a raw angle could look like a false "wraparound" mid-walk and get shifted by multiples of 360° — landing some labels back on top of earlier, unrelated ones. Fixed by unwrapping the raw azimuth sequence once, cleanly, before doing any pushing.
@@ -129,8 +133,16 @@ Explored going beyond ZIP-code fleet data to real per-building locations + LiDAR
 
 Verified against the live STAC API; recorded here because the code still has the bug.
 
-- **We are silently using 2018 elevation data against 2025 imagery.** Every DSM tile over both test areas exists in *both* a 2018 and a 2024 version. `fetch_dsm_chip()` collects every covering `.tif` with **no date sorting**, and `rasterio.merge` keeps the *first* dataset's pixels where tiles overlap — and the STAC API returns 2018 first. So every run so far has fit planes to the 2018 surface. (`fetch_swissimage_chip()` already sorts newest-first; `fetch_dsm_chip()` never got the same treatment.) **Fix is small:** sort items by `properties.datetime` descending before building the href list, same as the imagery fetch. That closes the imagery/elevation gap from 7 years to 1.
-  - **Why this matters beyond tidiness:** any array installed 2019–2025 appears in the 2025 photo but sits on a 2018 DSM that predates it — so we'd be fitting a plane to the roof *as it was before the panels existed*. This is a strong candidate explanation for several things chased in this session: outlier clusters under panel footprints, "panels raised above the roof deck," and especially the per-building registration shifts that scattered randomly instead of agreeing on one direction. The NCC check's "no consistent global offset" conclusion may be right about there being no *global* offset while still missing a real *per-building, temporal* mismatch. **Re-run both test areas after fixing the date selection before trusting any of the current tilt/azimuth numbers.**
+- **~~We are silently using 2018 elevation data against 2025 imagery.~~ FIXED 2026-09-05** (commit
+  `1307286`). `fetch_dsm_chip()` now sorts STAC items by `properties.datetime` descending before
+  building the href list, same as the imagery fetch. Verified live: both test areas return 4x 2018 +
+  4x 2024 tiles, and the API returns 2018 first, so `rasterio.merge` was keeping 2018 pixels.
+  **The effect was large.** Over one 20m box at the Wiedikon test building (8624 px), 2024 vs 2018
+  differ by >0.30m (the whole outlier threshold) across **49.3%** of pixels and by >1m across 18.4%.
+  Mean difference +0.007m, so no vertical bias -- the change is entirely local. One detection's
+  reported tilt moved 8.0deg -> 12.6deg on the fix alone. **Any tilt/azimuth number recorded in this
+  file before 2026-09-05 was fitted to 2018 elevation and should not be trusted.**
+
 - **Higher-resolution LiDAR is available and we're not using it.** swissSURFACE3D publishes two products, and we've only ever used the derived raster:
 
   | Collection | What it is | Density | Format |
@@ -175,3 +187,87 @@ sf-solar/
 ├── site/            # static website (GitHub Pages)
 └── .github/workflows/   # scheduled update job
 ```
+
+## Cross-examination findings (2026-09-05)
+
+An adversarial review of the whole CV branch. Every number below was **reproduced independently**
+against the cached detections (`data/level3_cv_*_detections.npz`) before being written down.
+
+**Confirmed, and serious:**
+
+- **Fitted tilt is a function of footprint size, not roof physics.** Spearman(area, tilt) over Wiedikon
+  = **−0.705, n=14, p=0.0048**; survives dropping the 66.3° outlier (−0.676, p=0.011). Median tilt is
+  **12.8° for footprints <120 m²** and **0.5° for ≥120 m²**. Altstetten shows −0.170 (p=0.58) only
+  because its smallest footprint is 212 m² — range restriction, not different physics. Mechanism is
+  leverage: for a small footprint, one contaminating edge DSM pixel at Δz≈10m swings the fit by
+  degrees. `MAX_OUTLIER_FRACTION = 0.2` makes this worse by switching the estimator between trimmed
+  and untrimmed as a function of size, so trimmed and untrimmed tilts are pooled in every plot and
+  claim despite being different estimators. **Plot tilt vs area on every run.**
+- **A "detection" is a tile, not an array.** `tile_chip()` uses stride == tile size, so a large array
+  is cut at seams and each piece becomes an independent detection with its own area, centroid and
+  plane fit. **12 of 13 Altstetten detections** and 3 of 19 Wiedikon detections belong to a mask
+  component that crosses a seam. This gives a free, ground-truth-free regression test — two fragments
+  of one contiguous surface must return the same plane — and it currently **fails**: median azimuth
+  disagreement 84°, max **179°**; max tilt disagreement 9.16°.
+- **`pv_area_m2` and `tilt_deg` describe different objects.** Area sums the whole tile mask across
+  every building in it; tilt comes from `planes[0]`, the single largest connected facet. A 256px tile
+  at 0.2359 m/px is 60m across — several buildings in dense Zurich.
+- **Segmentation badly under-covers large true positives.** On the 1322 m² and 584 m² arrays the masks
+  trace narrow strips across roofs that are panel-covered edge to edge.
+
+**Confirmed code defects (all still present):**
+
+- `fit_roof_plane()` returns coefficients inconsistent with its own mask when the loop exits by
+  exhausting `MAX_OUTLIER_ITERATIONS`: the last pass assigns `valid = tightened` and the loop ends with
+  no refit, so the returned `(a,b,c)` was fit to the previous, larger point set. `fit_group_planes()`
+  then peels leftovers against that stale pairing.
+- `tile_chip()` uses `range(0, h - TILE_PX, TILE_PX)` — exclusive, so the last full tile row and column
+  are never generated. At any dimension that is an exact multiple of 256, a whole row and column of the
+  chip goes unclassified.
+- `fetch_swissimage_chip()` uses `Resampling.bilinear` for a **2.36× decimation** with no anti-alias
+  prefilter, so periodic high-frequency structure folds — which is exactly what panel rows *and*
+  skylight glazing grids are. Plausible mechanical contributor to the skylight confusion; a one-word
+  fix (`Resampling.average`/`lanczos`) and a cheap experiment to re-score and diff.
+- No plausibility gate anywhere: a 66.3° "roof" was computed, cached, plotted and reported without a
+  warning, in a project whose central rule is sanity ranges.
+
+**The false-positive audit, withdrawn as a rate.** The native-10cm audit found the highest-confidence
+Wiedikon detection (p=0.952) is four dormer skylights while the two largest unambiguous real arrays
+score 0.348 and 0.260 — that specific observation stands and was independently confirmed by Christian.
+But the *rate* does not: labels were assigned with the model's own contour drawn over the imagery, by
+the person who built the pipeline (anchoring), and with 4 clear positives vs 4 clear negatives the
+minimum attainable one-sided p is 1/70, so the design cannot reject chance ranking even in principle.
+Depending on denominator the FP rate spans [0.14, 0.91]. **Treat it as unmeasured.** Nobody has looked
+at false *negatives* at all, and for an aggregate MW total missed capacity is the one-sided bias that
+actually matters.
+
+**Useful data source found:** `ch.bfe.elektrizitaetsproduktionsanlagen` (Swiss federal electricity
+production plants) is queryable via `api3.geo.admin.ch/rest/services/all/MapServer/identify` and returns
+PV plants with capacity and commissioning date — 17 within a 700m box over Wiedikon, 6 over Altstetten.
+Use it as a **denominator for recall**, not as a per-case confirmation oracle: coverage is incomplete
+and points are geocoded to street addresses, not array centroids. Also `ch.bfe.solarenergie-eignung-daecher`
+(sonnendach) publishes per-roof-facet tilt/azimuth nationally — a way to validate `fit_group_planes()`
+at n≈500 with no CV involved, though it measures the *roof* not the *panels*, so racks should disagree.
+
+### The strategic question nobody had asked
+
+`scripts/level3_fleet.py` already reads per-system `Tilt` and `Azimuth` straight from CA DG Stats, with
+the azimuth convention verified against the official data key. Running it:
+
+```
+Systems needing tilt/azimuth gap-fill ('multiple'): 376 (4.1% of capacity)
+```
+
+**95.9% of San Francisco's installed capacity already has measured tilt and azimuth.** This branch
+exists to derive, from imagery SF does not have, a quantity SF already knows. It has earned its keep —
+it surfaced the DSM date bug and a lot about the data — but it is **not on the critical path** to a
+citywide MW curve.
+
+Before any further investment here, do the one-hour pvlib sensitivity table: citywide MW error per 10°
+of tilt error and per 20° of azimuth error, at 09:00 / 12:00 / 17:00. For an instantaneous nowcast
+azimuth matters far more than annual-energy intuition suggests (an east- vs west-facing array at 20°
+tilt differs by 2–5× at 08:00 and 17:00). That number decides whether this branch deserves more effort
+than the capacity branch.
+
+Full three-way pipeline comparison (current / +point cloud / +normal segmentation) with all of today's
+measurements: https://claude.ai/code/artifact/c259959a-0425-451c-a7be-3dde0e962d5c
