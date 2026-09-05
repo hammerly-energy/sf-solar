@@ -21,6 +21,7 @@ How to work with me:
 - **Don't add abstractions I didn't ask for.** No class hierarchies, no plugin systems, no config frameworks. Flat scripts are fine.
 - **Tell me when I'm asking for something wrong.** If I request something that's a bad idea, push back and explain why rather than just building it.
 - **Small steps.** One working change at a time, committed, before moving on.
+- **Do one thing per turn.** Don't investigate adjacent problems you notice — mention them in one line and stop. Wait for me to say go.
 - If a step needs a tool or account I don't have yet, stop and tell me — don't work around it silently.
 
 ## The most important rule: silent wrongness
