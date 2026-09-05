@@ -125,7 +125,23 @@ Explored going beyond ZIP-code fleet data to real per-building locations + LiDAR
     - `fetch_swissimage_chip()` had the *exact same* single-tile bug `fetch_dsm_chip()` had before its earlier fix — only reading `items[0]` instead of mosaicking. Altstetten's bbox happened to straddle a SWISSIMAGE tile boundary (Wiedikon's didn't), silently truncating the fetched image to a fraction of the requested width and crashing the tile grid layout. Fixed the same way: `rasterio.merge.merge()` over all covering tiles, newest-first so overlaps still prefer the most recent acquisition.
     - The wind-rose's label-decluttering (added for Wiedikon) had a latent bug that only showed up with more detected arrays: it unwrapped azimuths past 360° by comparing each point's raw angle to the *previous label's already-pushed* position instead of to the *previous point's raw* position, so a raw angle could look like a false "wraparound" mid-walk and get shifted by multiples of 360° — landing some labels back on top of earlier, unrelated ones. Fixed by unwrapping the raw azimuth sequence once, cleanly, before doing any pushing.
 
-Backup candidates if Zurich hits a wall: Netherlands (PDOK/AHN, 25cm ortho + 6–10 pts/m² LiDAR, fully open) and Massachusetts, USA (MassGIS, 15cm ortho + QL1/QL2 LiDAR with DSM, public domain).
+### Open findings — investigated, NOT yet fixed (as of 2026-08-17)
+
+Verified against the live STAC API; recorded here because the code still has the bug.
+
+- **We are silently using 2018 elevation data against 2025 imagery.** Every DSM tile over both test areas exists in *both* a 2018 and a 2024 version. `fetch_dsm_chip()` collects every covering `.tif` with **no date sorting**, and `rasterio.merge` keeps the *first* dataset's pixels where tiles overlap — and the STAC API returns 2018 first. So every run so far has fit planes to the 2018 surface. (`fetch_swissimage_chip()` already sorts newest-first; `fetch_dsm_chip()` never got the same treatment.) **Fix is small:** sort items by `properties.datetime` descending before building the href list, same as the imagery fetch. That closes the imagery/elevation gap from 7 years to 1.
+  - **Why this matters beyond tidiness:** any array installed 2019–2025 appears in the 2025 photo but sits on a 2018 DSM that predates it — so we'd be fitting a plane to the roof *as it was before the panels existed*. This is a strong candidate explanation for several things chased in this session: outlier clusters under panel footprints, "panels raised above the roof deck," and especially the per-building registration shifts that scattered randomly instead of agreeing on one direction. The NCC check's "no consistent global offset" conclusion may be right about there being no *global* offset while still missing a real *per-building, temporal* mismatch. **Re-run both test areas after fixing the date selection before trusting any of the current tilt/azimuth numbers.**
+- **Higher-resolution LiDAR is available and we're not using it.** swissSURFACE3D publishes two products, and we've only ever used the derived raster:
+
+  | Collection | What it is | Density | Format |
+  |---|---|---|---|
+  | `ch.swisstopo.swisssurface3d-raster` | what the code uses now | 4.0 samples/m² | 0.5 m GeoTIFF |
+  | `ch.swisstopo.swisssurface3d` | the native point cloud | **28.7 points/m²** | 2024: COPC (`.copc.laz`), 2018: `.las.zip` |
+
+  ~7× denser, ~0.19 m average point spacing vs 0.5 m. Density read directly off a 2024 tile's LAS 1.4 header (28,667,671 points over a 1000×1000 m tile), not from documentation. The 2024 files are **COPC** (Cloud Optimized Point Cloud) and the server honours HTTP range requests (verified: returns `206`), so a single building's points can be read without downloading the ~1 km tile — the same trick as Cloud-Optimized GeoTIFF. Would also give multiple returns per pulse and classification codes, neither of which survive into the raster.
+  - Most relevant to the **known gap** above (small roofs whose several tilted rows all fit within 30 cm of one compromise plane, so `fit_group_planes()` never splits them): at 0.5 m the 97 m² test case only gets ~20 samples across its ~10 m span; at 0.19 m spacing it would get ~50, with enough points *per row* to fit each row separately.
+
+Backup candidates if Zurich hits a wall: Netherlands (PDOK/AHN, 25cm ortho + 6–10 pts/m² LiDAR, fully open) and Massachusetts, USA (MassGIS, 15cm ortho + QL1/QL2 LiDAR with DSM, public domain). Note both are *lower* density than the swissSURFACE3D point cloud (28.7 pts/m²) — there's no resolution argument for switching regions; the densest data we've found is already where we're working.
 
 Prototype code: `scripts/level3_cv_detection.py` (explicitly marked experimental, not part of the main pipeline). Model weights live in `data/raw/deepsolar_weights/` (gitignored, ~1.2GB — re-download via `gdown` from the Google Drive link in the DeepSolar-3M GitHub README if missing). Run with:
 ```
