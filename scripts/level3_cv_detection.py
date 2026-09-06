@@ -44,6 +44,7 @@ conflicts with these pins otherwise):
 """
 
 import json
+import os
 import sys
 
 import numpy as np
@@ -204,6 +205,37 @@ def fetch_naip_chip(bbox):
 
 SWISSIMAGE_NATIVE_MPP = 0.1
 
+# Resampling for the SWISSIMAGE decimation (0.1 -> 0.2359 m/px, a 2.36x
+# reduction). Plain bilinear samples the source without first removing detail
+# too fine to survive at the new spacing, so periodic structure finer than
+# that folds down into false coarse pattern -- and panel rows, skylight
+# glazing grids and painted parking-bay lines are all exactly that. That made
+# aliasing a plausible mechanical cause of the model confusing them.
+#
+# TESTED 2026-09-06 ON WIEDIKON, AND IT IS NOT THE CAUSE. Across the same
+# 100-tile grid, Resampling.average moved classifier scores by a mean of
+# +0.0055 (max 0.085) and lanczos by -0.0055 (max 0.087); no tile crossed the
+# 0.2 segmentation threshold under average, one did under lanczos. On nine
+# objects whose identity is settled independently of the model (six arrays
+# visible edge-to-edge in the imagery, the dormer skylights confirmed by eye
+# at native 10cm, and two detections the terrain model puts at 0.01 m and
+# -0.03 m above bare ground), the separation between real and not-PV was
+# +0.006 under bilinear, -0.027 under average and -0.011 under lanczos --
+# all three indistinguishable from zero. Under average the false positives
+# rose on all three. Detection count, total area (3022/3027/3001 m^2) and the
+# two impossible tilts were unchanged.
+#
+# So the default stays bilinear: the hypothesis that motivated changing it is
+# refuted, and switching would break comparability with everything already
+# measured for no benefit. The constant and the override are kept so the test
+# is one env var to repeat somewhere else -- a different city, a different
+# native resolution, or a different decimation ratio could still alias.
+#
+# Note this applies ONLY to SWISSIMAGE. fetch_naip_chip() ENLARGES (0.6 ->
+# 0.2359 m/px), and there is nothing to alias when upsampling -- bilinear is
+# correct there regardless. The asymmetry is deliberate.
+SWISSIMAGE_RESAMPLING = getattr(Resampling, os.environ.get("SWISSIMAGE_RESAMPLING", "bilinear"))
+
 # A dense residential district in Zurich (Wiedikon), comparable scale to the
 # Richmond test area. Switzerland has very high per-capita rooftop solar
 # adoption, so a broad scan is more likely to find real positives than
@@ -295,7 +327,7 @@ def fetch_swissimage_chip(bbox):
             src_crs=src_crs,
             dst_transform=dst_transform,
             dst_crs=src_crs,
-            resampling=Resampling.bilinear,
+            resampling=SWISSIMAGE_RESAMPLING,
         )
     return resampled, dst_transform, src_crs
 
@@ -536,7 +568,7 @@ def find_pv_arrays(image, tiles, results, transform, crs, threshold=0.2):
     return arrays
 
 
-def save_detection_cache(arrays, image_transform, image_crs, output_path):
+def save_detection_cache(arrays, image_transform, image_crs, output_path, tile_results=None):
     """Dump every detection (segmentation mask + geometry) to a .npz.
 
     The full pipeline takes ~10 minutes, mostly model inference. Anything that
@@ -551,6 +583,13 @@ def save_detection_cache(arrays, image_transform, image_crs, output_path):
         "crs": np.array(str(image_crs)),
         "n_arrays": np.array(len(arrays)),
     }
+    if tile_results is not None:
+        # every tile's raw classifier score, keyed by its position in the chip.
+        # Lets a change upstream of the classifier be measured at the classifier,
+        # rather than only through what survives segmentation.
+        payload["tile_scores"] = np.array(
+            [[r["y0"], r["x0"], r["p_pv"]] for r in tile_results], dtype=float
+        )
     for i, a in enumerate(arrays):
         payload[f"mask_{i}"] = a["mask"].astype(np.uint8)
         payload[f"meta_{i}"] = np.array(
@@ -1479,7 +1518,7 @@ def main():
                             f"azimuth={plane['azimuth_deg']:.0f}deg  n_dsm_px={plane['n_dsm_pixels']}{outlier_note}"
                         )
 
-        save_detection_cache(arrays, transform, crs, f"data/level3_cv_{mode}_detections.npz")
+        save_detection_cache(arrays, transform, crs, f"data/level3_cv_{mode}_detections.npz", tile_results=results)
 
         location_label = "Altstetten, Zurich" if mode == "altstetten" else "Wiedikon, Zurich"
         save_roof_geometry_windrose(arrays, f"data/level3_cv_{mode}_roof_geometry.png", location_label)

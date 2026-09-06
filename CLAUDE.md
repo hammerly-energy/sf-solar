@@ -239,10 +239,21 @@ against the cached detections (`data/level3_cv_*_detections.npz`) before being w
 - `tile_chip()` uses `range(0, h - TILE_PX, TILE_PX)` — exclusive, so the last full tile row and column
   are never generated. At any dimension that is an exact multiple of 256, a whole row and column of the
   chip goes unclassified.
-- `fetch_swissimage_chip()` uses `Resampling.bilinear` for a **2.36× decimation** with no anti-alias
-  prefilter, so periodic high-frequency structure folds — which is exactly what panel rows *and*
-  skylight glazing grids are. Plausible mechanical contributor to the skylight confusion; a one-word
-  fix (`Resampling.average`/`lanczos`) and a cheap experiment to re-score and diff.
+- ~~`fetch_swissimage_chip()` uses `Resampling.bilinear` for a **2.36× decimation** with no
+  anti-alias prefilter~~ — **TESTED 2026-09-06, NOT THE CAUSE. Do not re-try this.** The mechanism
+  was plausible (panel rows, skylight glazing grids and painted parking-bay lines are all periodic
+  structure that folds under undersampling), but across the same 100-tile Wiedikon grid
+  `Resampling.average` moved classifier scores by a mean of **+0.0055** (max 0.085) and `lanczos` by
+  **−0.0055** (max 0.087). No tile crossed the 0.2 segmentation threshold under `average`; one did
+  under `lanczos`. On nine objects labelled independently of the model — six arrays visible
+  edge-to-edge in the imagery, the dormer skylights Christian confirmed at native 10 cm, and two
+  detections swissALTI3D puts at 0.01 m and −0.03 m above bare ground — the separation between real
+  and not-PV was **+0.006 (bilinear), −0.027 (average), −0.011 (lanczos)**: all three
+  indistinguishable from zero, and under `average` the false positives rose on all three. Detection
+  count, total area (3022/3027/3001 m²) and the two impossible tilts were unchanged. Default stays
+  `bilinear`; `SWISSIMAGE_RESAMPLING` env var kept so the test is one command to repeat elsewhere.
+  **The real finding is that the classifier does not separate PV from skylights or parking decks at
+  all, under any filter** — this is a model/discrimination problem, not a preprocessing one.
 - No plausibility gate anywhere: a 66.3° "roof" was computed, cached, plotted and reported without a
   warning, in a project whose central rule is sanity ranges.
 
