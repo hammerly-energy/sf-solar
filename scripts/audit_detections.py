@@ -1,4 +1,7 @@
-"""Visual audit: draw each detection's segmentation OUTLINE over native 10cm SWISSIMAGE.
+"""Visual audit: draw each detected array's segmentation OUTLINE over native 10cm SWISSIMAGE.
+
+One panel per stitched array (largest first), not one per tile -- see
+find_pv_arrays() in level3_cv_detection.py.
 
 Reads the .npz cache written by level3_cv_detection.py so this doesn't re-run
 model inference. Outline (not a filled overlay) on purpose -- a translucent
@@ -46,13 +49,14 @@ def main():
 
     dets = []
     for i in range(n):
-        p_pv, y0, x0, area, lat, lon, tilt, az = cache[f"meta_{i}"]
+        p_pv, y0, x0, area, lat, lon, tilt, az, n_tiles, truncated = cache[f"meta_{i}"]
         mask = cache[f"mask_{i}"].astype(bool)
         if mask.sum() == 0:
             continue
         dets.append(dict(i=i, p_pv=p_pv, y0=int(y0), x0=int(x0), area=area,
-                         lat=lat, lon=lon, tilt=tilt, az=az, mask=mask))
-    dets.sort(key=lambda d: -d["p_pv"])
+                         lat=lat, lon=lon, tilt=tilt, az=az, mask=mask,
+                         n_tiles=int(n_tiles), truncated=bool(truncated)))
+    dets.sort(key=lambda d: -d["area"])
     print(f"{mode}: {n} detections cached, {len(dets)} with PV pixels")
 
     ncols = 4
@@ -74,8 +78,14 @@ def main():
                    extent=(left, right, bottom, top), origin="upper",
                    colors="#eb6834", linewidths=2.0)
         tilt_s = "--" if np.isnan(d["tilt"]) else f"{d['tilt']:.1f}/{d['az']:.0f}"
+        seam = []
+        if d["n_tiles"] > 1:
+            seam.append(f"{d['n_tiles']} tiles")
+        if d["truncated"]:
+            seam.append("cut at seam?")
+        seam_s = f"   [{', '.join(seam)}]" if seam else ""
         ax.set_title(f"p={d['p_pv']:.3f}   {d['area']:.0f} m²   tilt/az={tilt_s}\n"
-                     f"{crop[2]-crop[0]:.0f} m across", fontsize=10)
+                     f"{crop[2]-crop[0]:.0f} m across{seam_s}", fontsize=10)
         ax.set_xticks([]); ax.set_yticks([])
         print(f"  p={d['p_pv']:.3f} {d['area']:.0f}m2 {crop[2]-crop[0]:.0f}m crop")
 

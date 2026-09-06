@@ -385,44 +385,154 @@ def save_tile_grid(tiles, results, target_lonlat, output_path, target_label="tar
     print(f"Saved tile grid to {output_path}")
 
 
-def find_pv_arrays(tiles, results, transform, crs, threshold=0.2):
-    """Run segmentation on tiles the classifier flagged as plausible PV,
-    and return one record per tile with a real-world centroid for its
-    detected panel pixels (empty mask -> centroid is None, classifier's
-    threshold guess was likely wrong)."""
+MIN_BLOB_PX = 30  # ~1.7 m^2 at TARGET_MPP -- roughly one solar module
+
+
+def combine_tile_confidence(pixel_confidences):
+    """Collapse a stitched blob's per-pixel classifier confidences into one
+    number for the whole array.
+
+    A blob that spans several tiles inherits a different p_pv from each tile
+    it touches. `pixel_confidences` is a 1-D array with one entry per blob
+    pixel: the p_pv of whichever tile that pixel was segmented in.
+
+    Area-weighted mean, which is what taking the mean over PIXELS already
+    gives us for free -- a blob with 3000 pixels in a confident tile and 200
+    in a doubtful one is pulled mostly by the confident tile, in proportion
+    to how much of the array actually sits there.
+
+    Not max(): "one tile was sure, so the whole array counts as sure" is
+    exactly the failure mode we already have evidence for -- the
+    highest-scoring Wiedikon detection (p=0.952) turned out to be four dormer
+    skylights, while the two largest unambiguous real arrays scored 0.348 and
+    0.260. Nothing about this classifier earns the benefit of the doubt.
+    Not min() either: that would punish a large, genuine array for extending
+    a few pixels into one unconvincing tile.
+
+    NOTE: the result is a summary statistic, not a calibrated probability.
+    The model outputs p(PV) for a whole 60m tile; averaging several of those
+    does not produce p(PV) for one roof. Read it as a relative ranking
+    between arrays, and keep a["tile_p_pv"] if you need the raw values.
+    """
+    return float(np.mean(pixel_confidences))
+
+
+def _pad_slice(sl, shape, pad=1):
+    """Grow a 2-D bounding-box slice by `pad` pixels, clipped to the array."""
+    return tuple(slice(max(s.start - pad, 0), min(s.stop + pad, dim)) for s, dim in zip(sl, shape))
+
+
+def find_pv_arrays(image, tiles, results, transform, crs, threshold=0.2):
+    """Segment every tile the classifier flagged, stitch the tile-local masks
+    back into ONE full-image canvas, and return one record per spatially-
+    connected blob of panel pixels -- not one record per tile.
+
+    The 256x256 tile exists only because the models were trained on that
+    input size. It is an input constraint, not a unit of measurement. Before
+    this stitched, a roof crossing a tile seam became two or three separate
+    "arrays", each with its own area, centroid and plane fit: on the
+    Altstetten test area 12 of 13 detections were fragments like that, and
+    fragments of one surface disagreed by up to 179 degrees in azimuth.
+
+    Each returned record uses the blob's own bounding box as its frame:
+      mask   -- boolean, blob-local (the bounding box of this blob only)
+      y0/x0  -- top-left of that box in full-image pixel coords
+      pixels -- the RGB crop of the full image over the same box
+    which is the same (mask, y0, x0, pixels) contract the tile-based records
+    had, so everything downstream keeps working unchanged -- it now just
+    describes one contiguous surface instead of one square of image.
+    """
+    from scipy import ndimage
+
     print("Loading segmentation model...")
     seg_model = load_segmentation_model()
     seg_processor = SegformerImageProcessor(reduce_labels=False)
 
     tiles_by_pos = {(t["y0"], t["x0"]): t for t in tiles}
-    arrays = []
-    for r in results:
-        if r["p_pv"] < threshold:
-            continue
+    flagged = [r for r in results if r["p_pv"] >= threshold]
+
+    _, img_h, img_w = image.shape
+    canvas = np.zeros((img_h, img_w), dtype=bool)
+    # which pixels the segmenter actually looked at -- a blob that runs up
+    # against an unsegmented tile may have been cut short at that seam
+    segmented = np.zeros((img_h, img_w), dtype=bool)
+    # which flagged tile each pixel came from, so a blob can be traced back
+    # to the tiles (and the confidences) that produced it
+    tile_index = np.full((img_h, img_w), -1, dtype=np.int32)
+
+    n_empty = 0
+    for i, r in enumerate(flagged):
         tile = tiles_by_pos[(r["y0"], r["x0"])]
         mask = segment_tile(tile["pixels"], seg_model, seg_processor)
-        pv_px = int(mask.sum())
-        centroid_lon = centroid_lat = None
-        if pv_px > 0:
-            rows, cols = np.nonzero(mask)
-            abs_row = tile["y0"] + rows.mean()
-            abs_col = tile["x0"] + cols.mean()
-            utm_x, utm_y = rasterio.transform.xy(transform, abs_row, abs_col)
-            centroid_lon, centroid_lat = rasterio.warp.transform(crs, "EPSG:4326", [utm_x], [utm_y])
-            centroid_lon, centroid_lat = centroid_lon[0], centroid_lat[0]
+        ys = slice(tile["y0"], tile["y0"] + TILE_PX)
+        xs = slice(tile["x0"], tile["x0"] + TILE_PX)
+        canvas[ys, xs] |= mask
+        segmented[ys, xs] = True
+        tile_index[ys, xs] = i
+        if not mask.any():
+            n_empty += 1
+    print(
+        f"Segmented {len(flagged)} flagged tiles "
+        f"({n_empty} produced no PV pixels at all -- classifier likely wrong there)"
+    )
+    tile_conf = np.array([r["p_pv"] for r in flagged], dtype=float)
+
+    # ONE connected-component pass over the whole canvas. Panel pixels either
+    # side of a seam are literally adjacent here, so they join into one blob
+    # and the tile boundary stops existing.
+    labels, n_blobs = ndimage.label(canvas, structure=np.ones((3, 3)))
+
+    arrays = []
+    n_dropped = 0
+    n_pieces = 0
+    for blob_id, sl in enumerate(ndimage.find_objects(labels), start=1):
+        if sl is None:
+            continue
+        sub = labels[sl] == blob_id
+        n_px = int(sub.sum())
+        if n_px < MIN_BLOB_PX:
+            n_dropped += 1
+            continue
+
+        y0, x0 = sl[0].start, sl[1].start
+        rows, cols = np.nonzero(sub)
+        utm_x, utm_y = rasterio.transform.xy(transform, y0 + rows.mean(), x0 + cols.mean())
+        centroid_lon, centroid_lat = rasterio.warp.transform(crs, "EPSG:4326", [utm_x], [utm_y])
+
+        pixel_tiles = tile_index[sl][sub]
+        contributing = np.unique(pixel_tiles)
+        n_pieces += len(contributing)
+
+        # did this blob stop at the edge of the segmented area? if so it may
+        # be a real array cut short, not a complete one -- overlapping
+        # inference (stride < TILE_PX) is what would fix that, not stitching
+        psl = _pad_slice(sl, canvas.shape)
+        grown = ndimage.binary_dilation(labels[psl] == blob_id, structure=np.ones((3, 3)))
+        truncated = bool((grown & ~segmented[psl]).any())
+
         arrays.append(
             {
-                "p_pv": r["p_pv"],
-                "mask": mask,
-                "pv_pixel_count": pv_px,
-                "pv_area_m2": pv_px * (TARGET_MPP**2),
-                "centroid_lon": centroid_lon,
-                "centroid_lat": centroid_lat,
-                "y0": tile["y0"],
-                "x0": tile["x0"],
-                "pixels": tile["pixels"],
+                "p_pv": combine_tile_confidence(tile_conf[pixel_tiles]),
+                "tile_p_pv": tile_conf[contributing],
+                "n_tiles": len(contributing),
+                "possibly_truncated": truncated,
+                "mask": sub,
+                "pixels": image[:, sl[0], sl[1]],
+                "pv_pixel_count": n_px,
+                "pv_area_m2": n_px * (TARGET_MPP**2),
+                "centroid_lon": centroid_lon[0],
+                "centroid_lat": centroid_lat[0],
+                "y0": y0,
+                "x0": x0,
             }
         )
+
+    arrays.sort(key=lambda a: -a["pv_area_m2"])
+    n_multi = sum(1 for a in arrays if a["n_tiles"] > 1)
+    n_trunc = sum(1 for a in arrays if a["possibly_truncated"])
+    print(f"Stitched into {len(arrays)} arrays ({n_dropped} blobs dropped as smaller than ~1 module)")
+    print(f"  assembled from {n_pieces} tile-level pieces; {n_multi} arrays span more than one tile")
+    print(f"  {n_trunc} run up against a tile that was never segmented -- possibly cut short at a seam")
     return arrays
 
 
@@ -432,8 +542,9 @@ def save_detection_cache(arrays, image_transform, image_crs, output_path):
     The full pipeline takes ~10 minutes, mostly model inference. Anything that
     wants to re-examine the detections afterwards -- a visual audit, a
     threshold sweep, a different plot -- should read this cache instead of
-    re-running inference. Masks are tile-local; y0/x0 place each tile in the
-    full image, and image_transform maps full-image pixels to CRS coords.
+    re-running inference. Masks are blob-local; y0/x0 place each blob's
+    bounding box in the full image, and image_transform maps full-image
+    pixels to CRS coords.
     """
     payload = {
         "transform": np.array(image_transform.to_gdal(), dtype=float),
@@ -452,6 +563,8 @@ def save_detection_cache(arrays, image_transform, image_crs, output_path):
                 a["centroid_lon"] if a["centroid_lon"] is not None else np.nan,
                 a.get("tilt_deg") if a.get("tilt_deg") is not None else np.nan,
                 a.get("azimuth_deg") if a.get("azimuth_deg") is not None else np.nan,
+                a["n_tiles"],
+                float(a["possibly_truncated"]),
             ],
             dtype=float,
         )
@@ -459,27 +572,39 @@ def save_detection_cache(arrays, image_transform, image_crs, output_path):
     print(f"Saved detection cache ({len(arrays)} arrays) to {output_path}")
 
 
+MAX_OVERLAY_PANELS = 12
+
+
 def save_segmentation_overlays(arrays, output_path):
+    """One panel per detected array, largest first. Each panel is that array's
+    own bounding box, so panels differ in size and shape -- they are arrays
+    now, not uniform tiles."""
     import matplotlib.pyplot as plt
 
-    arrays_with_pv = [a for a in arrays if a["pv_pixel_count"] > 0]
-    if not arrays_with_pv:
-        print("No tiles had any segmented PV pixels -- skipping overlay plot.")
+    if not arrays:
+        print("No arrays detected -- skipping overlay plot.")
         return
 
-    fig, axes = plt.subplots(1, len(arrays_with_pv), figsize=(4 * len(arrays_with_pv), 4.5))
-    axes = np.atleast_1d(axes)
-    for ax, a in zip(axes, arrays_with_pv):
+    shown = arrays[:MAX_OVERLAY_PANELS]  # arrays arrive sorted largest-first
+    ncols = min(4, len(shown))
+    nrows = int(np.ceil(len(shown) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4.5 * nrows))
+    axes = np.atleast_1d(axes).ravel()
+    for ax, a in zip(axes, shown):
         img = np.transpose(a["pixels"], (1, 2, 0))
         ax.imshow(img)
         overlay = np.zeros((*a["mask"].shape, 4))
         overlay[a["mask"]] = [1, 1, 0, 0.5]  # yellow, semi-transparent
         ax.imshow(overlay)
-        ax.set_title(f"p_pv={a['p_pv']:.3f}\n{a['pv_area_m2']:.0f} m^2 panel area", fontsize=9)
+        seam_note = f", {a['n_tiles']} tiles" if a["n_tiles"] > 1 else ""
+        ax.set_title(f"p_pv={a['p_pv']:.3f}{seam_note}\n{a['pv_area_m2']:.0f} m^2 panel area", fontsize=9)
         ax.set_xticks([])
         ax.set_yticks([])
+    for ax in axes[len(shown):]:
+        ax.axis("off")
 
-    fig.suptitle("Segmented PV pixels (yellow overlay)")
+    omitted = f" -- showing the {len(shown)} largest of {len(arrays)}" if len(arrays) > len(shown) else ""
+    fig.suptitle(f"Segmented PV pixels (yellow overlay){omitted}")
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
     print(f"Saved segmentation overlay to {output_path}")
@@ -848,7 +973,37 @@ def save_roof_geometry_windrose(arrays, output_path, location_label="Wiedikon, Z
     print(f"Saved roof geometry wind-rose to {output_path}")
 
 
-def save_building_detail(array, output_path):
+def crop_around_array(array, image, image_transform, bounds):
+    """RGB crop of the FULL image over `bounds` (left, bottom, right, top in
+    the image CRS), with this array's blob mask pasted into the same frame.
+
+    Needed because an array's bounding box is now tight around its own panel
+    pixels -- any context around it (the rest of the roof, the neighbouring
+    building) has to be re-cut from the full image, not read off the record.
+    Returns (rgb HWC, mask, bounds actually covered).
+    """
+    left, bottom, right, top = bounds
+    _, img_h, img_w = image.shape
+    rows, cols = rasterio.transform.rowcol(image_transform, [left, right], [top, bottom])
+    r0, r1 = sorted((max(int(rows[0]), 0), min(int(rows[1]), img_h)))
+    c0, c1 = sorted((max(int(cols[0]), 0), min(int(cols[1]), img_w)))
+    rgb = np.transpose(image[:, r0:r1, c0:c1], (1, 2, 0))
+
+    mask = np.zeros((r1 - r0, c1 - c0), dtype=bool)
+    mh, mw = array["mask"].shape
+    my0, mx0 = array["y0"] - r0, array["x0"] - c0  # blob box, in crop-local coords
+    sy0, sx0 = max(my0, 0), max(mx0, 0)
+    sy1, sx1 = min(my0 + mh, r1 - r0), min(mx0 + mw, c1 - c0)
+    if sy1 > sy0 and sx1 > sx0:
+        mask[sy0:sy1, sx0:sx1] = array["mask"][sy0 - my0 : sy1 - my0, sx0 - mx0 : sx1 - mx0]
+
+    crop_transform = rasterio.windows.transform(
+        rasterio.windows.Window(c0, r0, c1 - c0, r1 - r0), image_transform
+    )
+    return rgb, mask, rasterio.transform.array_bounds(r1 - r0, c1 - c0, crop_transform)
+
+
+def save_building_detail(array, image, image_transform, output_path):
     """One building, two views of the same footprint: the SWISSIMAGE tile
     with its segmented PV mask, next to the raw swissSURFACE3D DSM heights
     for that footprint and the plane fitted through them.
@@ -881,12 +1036,26 @@ def save_building_detail(array, output_path):
 
     fig = plt.figure(figsize=(13, 6.5))
 
+    # pad outward from the blob's own (tight) bounding box so the roof around
+    # the array is visible, not just the panels themselves
+    mh, mw = array["mask"].shape
+    box_left, box_top = image_transform * (array["x0"], array["y0"])
+    box_right, box_bottom = image_transform * (array["x0"] + mw, array["y0"] + mh)
+    pad = 0.25 * max(box_right - box_left, box_top - box_bottom)
+    rgb, mask_crop, _ = crop_around_array(
+        array, image, image_transform, (box_left - pad, box_bottom - pad, box_right + pad, box_top + pad)
+    )
+
     ax1 = fig.add_subplot(1, 2, 1)
-    ax1.imshow(np.transpose(array["pixels"], (1, 2, 0)))
-    overlay = np.zeros((*array["mask"].shape, 4))
-    overlay[array["mask"]] = [1, 1, 0, 0.5]  # yellow, semi-transparent
+    ax1.imshow(rgb)
+    overlay = np.zeros((*mask_crop.shape, 4))
+    overlay[mask_crop] = [1, 1, 0, 0.5]  # yellow, semi-transparent
     ax1.imshow(overlay)
-    ax1.set_title(f"SWISSIMAGE tile + segmented PV mask\np(PV)={array['p_pv']:.3f}, area={array['pv_area_m2']:.0f} m²")
+    seam_note = f" (stitched from {array['n_tiles']} tiles)" if array["n_tiles"] > 1 else ""
+    ax1.set_title(
+        f"SWISSIMAGE + segmented PV mask{seam_note}\n"
+        f"p(PV)={array['p_pv']:.3f}, area={array['pv_area_m2']:.0f} m²"
+    )
     ax1.set_xticks([])
     ax1.set_yticks([])
 
@@ -929,7 +1098,7 @@ def save_building_detail(array, output_path):
     print(f"Saved building detail to {output_path}")
 
 
-def save_registration_check(array, image_transform, output_path, margin_m=3):
+def save_registration_check(array, image, image_transform, output_path, margin_m=3):
     """Sanity check that SWISSIMAGE and the swissSURFACE3D DSM are actually
     co-registered, rather than just assumed to be because both claim
     EPSG:2056. Takes the ONE segmentation footprint (the ground truth) and
@@ -947,9 +1116,6 @@ def save_registration_check(array, image_transform, output_path, margin_m=3):
         print("Selected array has no DSM footprint -- skipping registration check.")
         return
 
-    tile_transform = rasterio.windows.transform(
-        rasterio.windows.Window(array["x0"], array["y0"], TILE_PX, TILE_PX), image_transform
-    )
 
     dsm_window = array["dsm_window"]
     dsm_transform = array["dsm_window_transform"]
@@ -957,15 +1123,11 @@ def save_registration_check(array, image_transform, output_path, margin_m=3):
     crop_left, crop_right = dsm_left - margin_m, dsm_right + margin_m
     crop_bottom, crop_top = dsm_bottom - margin_m, dsm_top + margin_m
 
-    # crop the RGB tile down to the same real-world extent as the DSM window,
-    # so both panels show the same physical area at comparable scale
-    rows, cols = rasterio.transform.rowcol(tile_transform, [crop_left, crop_right], [crop_top, crop_bottom])
-    r0, r1 = sorted((max(int(rows[0]), 0), min(int(rows[1]), TILE_PX)))
-    c0, c1 = sorted((max(int(cols[0]), 0), min(int(cols[1]), TILE_PX)))
-    rgb_crop = np.transpose(array["pixels"][:, r0:r1, c0:c1], (1, 2, 0))
-    mask_crop = array["mask"][r0:r1, c0:c1]
-    rgb_crop_transform = rasterio.windows.transform(rasterio.windows.Window(c0, r0, c1 - c0, r1 - r0), tile_transform)
-    rgb_bounds = rasterio.transform.array_bounds(r1 - r0, c1 - c0, rgb_crop_transform)
+    # cut the RGB to the same real-world extent as the DSM window, so both
+    # panels show the same physical area at comparable scale
+    rgb_crop, mask_crop, rgb_bounds = crop_around_array(
+        array, image, image_transform, (crop_left, crop_bottom, crop_right, crop_top)
+    )
 
     # shared local origin so both panels plot in the identical coordinate frame --
     # this, not each panel's own data, is what makes the comparison meaningful
@@ -1007,7 +1169,7 @@ def save_registration_check(array, image_transform, output_path, margin_m=3):
     print(f"Saved registration check to {output_path}")
 
 
-def save_outlier_check(array, image_transform, output_path, margin_m=3):
+def save_outlier_check(array, image, image_transform, output_path, margin_m=3):
     """Show exactly where fit_roof_plane()'s rejected outlier points sit, on
     both the orthophoto and the raw DSM, in the same shared real-world
     coordinates -- so it's checkable by eye whether a rejected point
@@ -1032,21 +1194,14 @@ def save_outlier_check(array, image_transform, output_path, margin_m=3):
         print("Selected array had zero rejected outliers -- skipping outlier check.")
         return
 
-    tile_transform = rasterio.windows.transform(
-        rasterio.windows.Window(array["x0"], array["y0"], TILE_PX, TILE_PX), image_transform
-    )
 
     dsm_left, dsm_bottom, dsm_right, dsm_top = rasterio.transform.array_bounds(*dsm_window.shape, dsm_transform)
     crop_left, crop_right = dsm_left - margin_m, dsm_right + margin_m
     crop_bottom, crop_top = dsm_bottom - margin_m, dsm_top + margin_m
 
-    rows, cols = rasterio.transform.rowcol(tile_transform, [crop_left, crop_right], [crop_top, crop_bottom])
-    r0, r1 = sorted((max(int(rows[0]), 0), min(int(rows[1]), TILE_PX)))
-    c0, c1 = sorted((max(int(cols[0]), 0), min(int(cols[1]), TILE_PX)))
-    rgb_crop = np.transpose(array["pixels"][:, r0:r1, c0:c1], (1, 2, 0))
-    mask_crop = array["mask"][r0:r1, c0:c1]
-    rgb_crop_transform = rasterio.windows.transform(rasterio.windows.Window(c0, r0, c1 - c0, r1 - r0), tile_transform)
-    rgb_bounds = rasterio.transform.array_bounds(r1 - r0, c1 - c0, rgb_crop_transform)
+    rgb_crop, mask_crop, rgb_bounds = crop_around_array(
+        array, image, image_transform, (crop_left, crop_bottom, crop_right, crop_top)
+    )
 
     ox, oy = crop_left, crop_bottom
 
@@ -1251,7 +1406,7 @@ def main():
 
     if mode in ZURICH_MODES:
         print("\nRunning segmentation on plausible-PV tiles...")
-        arrays = find_pv_arrays(tiles, results, transform, crs, threshold=0.2)
+        arrays = find_pv_arrays(image, tiles, results, transform, crs, threshold=0.2)
         save_segmentation_overlays(arrays, f"data/level3_cv_{mode}_segmentation.png")
 
         print("\nFetching swissSURFACE3D DSM for roof-plane fitting...")
@@ -1260,18 +1415,23 @@ def main():
 
         print("\nDetected PV arrays -- location, size, and fitted roof geometry:")
         for a in arrays:
-            if a["centroid_lon"] is None:
-                print(f"  p_pv={a['p_pv']:.3f}  no PV pixels segmented (classifier likely wrong)")
-            elif a["tilt_deg"] is None:
+            notes = []
+            if a["n_tiles"] > 1:
+                notes.append(f"stitched from {a['n_tiles']} tiles")
+            if a["possibly_truncated"]:
+                notes.append("may be cut short at a seam")
+            note = f"  [{'; '.join(notes)}]" if notes else ""
+            if a["tilt_deg"] is None:
                 print(
                     f"  p_pv={a['p_pv']:.3f}  area={a['pv_area_m2']:.0f}m^2  "
-                    f"lat={a['centroid_lat']:.6f}  lon={a['centroid_lon']:.6f}  (footprint too small to fit a plane)"
+                    f"lat={a['centroid_lat']:.6f}  lon={a['centroid_lon']:.6f}  "
+                    f"(footprint too small to fit a plane){note}"
                 )
             else:
                 print(
                     f"  p_pv={a['p_pv']:.3f}  area={a['pv_area_m2']:.0f}m^2  "
                     f"lat={a['centroid_lat']:.6f}  lon={a['centroid_lon']:.6f}  "
-                    f"tilt={a['tilt_deg']:.1f}deg  azimuth={a['azimuth_deg']:.0f}deg"
+                    f"tilt={a['tilt_deg']:.1f}deg  azimuth={a['azimuth_deg']:.0f}deg{note}"
                 )
                 if len(a["roof_planes"]) > 1 or a["roof_planes"][0]["n_outliers_rejected"] > 0:
                     for i, plane in enumerate(a["roof_planes"]):
@@ -1289,11 +1449,11 @@ def main():
         fitted = [a for a in arrays if a.get("tilt_deg") is not None]
         if fitted:
             best = max(fitted, key=lambda a: a["p_pv"])
-            save_building_detail(best, f"data/level3_cv_{mode}_building_detail.png")
-            save_registration_check(best, transform, f"data/level3_cv_{mode}_registration_check.png")
+            save_building_detail(best, image, transform, f"data/level3_cv_{mode}_building_detail.png")
+            save_registration_check(best, image, transform, f"data/level3_cv_{mode}_registration_check.png")
 
             most_outliers = max(fitted, key=lambda a: sum(p["n_outliers_rejected"] for p in a["roof_planes"]))
-            save_outlier_check(most_outliers, transform, f"data/level3_cv_{mode}_outlier_check.png")
+            save_outlier_check(most_outliers, image, transform, f"data/level3_cv_{mode}_outlier_check.png")
 
             check_registration_offset(fitted)
 
