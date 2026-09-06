@@ -254,8 +254,25 @@ against the cached detections (`data/level3_cv_*_detections.npz`) before being w
   `bilinear`; `SWISSIMAGE_RESAMPLING` env var kept so the test is one command to repeat elsewhere.
   **The real finding is that the classifier does not separate PV from skylights or parking decks at
   all, under any filter** — this is a model/discrimination problem, not a preprocessing one.
-- No plausibility gate anywhere: a 66.3° "roof" was computed, cached, plotted and reported without a
-  warning, in a project whose central rule is sanity ranges.
+- ~~No plausibility gate anywhere: a 66.3° "roof" was computed, cached, plotted and reported without
+  a warning~~ — **FIXED 2026-09-06.** `apply_plausibility_gates()` adds two: **height above bare
+  terrain < 2 m** (swissSURFACE3D DSM minus swissALTI3D DTM, `fetch_dtm_chip()`) and **tilt > 60°**.
+  Wiedikon: 3 of 24 flagged, 3.2% of area, **no real array touched** — the two at-grade detections
+  measured +0.02 m and −0.03 m against 10.9–37.8 m for every confirmed array, and the 43 m² object
+  trips both gates independently. Altstetten: 0 of 14 flagged.
+  **Nothing is deleted, deliberately** — ground-mounted PV is genuinely at grade (this project's own
+  positive control, SF's Sunset Reservoir farm, is ground-mounted) and facade PV is genuinely
+  near-vertical; a silent drop would delete real capacity, the one direction an aggregate MW total
+  cannot afford to be wrong in. The wind-rose plots the plausible set only (one 66° point sets the
+  radial scale for every other marker); the console and cache keep everything.
+  **Caveat:** the gate's headroom is a property of the neighbourhood. Altstetten's lowest real
+  detection is 2.7 m (industrial sheds), a 0.7 m margin vs Wiedikon's 8.9 m. In a low-rise area
+  (carports, single-storey garages) 2 m would start clipping real arrays — check the height
+  distribution before trusting this in a new city.
+  **Does not touch the skylights**: at 14.6 m up and 12.6° tilt they are geometrically unremarkable.
+  Both gates are physical-impossibility checks, and the skylights are not impossible, just not PV.
+  Note swissALTI3D publishes BOTH a 0.5 m and a 2 m GeoTIFF per item — matching on `.tif` alone
+  mosaics two resolutions together, hence the explicit `_0.5_` filter in `fetch_dtm_chip()`.
 
 **The false-positive audit, withdrawn as a rate.** The native-10cm audit found the highest-confidence
 Wiedikon detection (p=0.952) is four dormer skylights while the two largest unambiguous real arrays

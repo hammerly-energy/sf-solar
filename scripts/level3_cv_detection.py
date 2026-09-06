@@ -604,6 +604,9 @@ def save_detection_cache(arrays, image_transform, image_crs, output_path, tile_r
                 a.get("azimuth_deg") if a.get("azimuth_deg") is not None else np.nan,
                 a["n_tiles"],
                 float(a["possibly_truncated"]),
+                a.get("height_above_ground_m") if a.get("height_above_ground_m") is not None else np.nan,
+                float(a.get("at_grade", False)),
+                float(a.get("implausible_tilt", False)),
             ],
             dtype=float,
         )
@@ -691,6 +694,133 @@ def fetch_dsm_chip(bbox):
 OUTLIER_RESIDUAL_M = 0.3  # a point this far from the fitted plane is treated as a stray LiDAR return, not roof
 MAX_OUTLIER_ITERATIONS = 3
 MAX_OUTLIER_FRACTION = 0.2  # refuse to discard more than this share of a cluster as "artifacts"
+
+
+# --- plausibility gates -------------------------------------------------
+#
+# A rooftop array sits metres above the surrounding terrain; a parking deck,
+# a courtyard or a forecourt sits on it. DSM (the surface, buildings included)
+# minus DTM (bare terrain) is that height. Measured over Wiedikon on
+# 2026-09-06: every detection on a real roof came out 10-38 m up, and the two
+# confirmed false positives came out at 0.01 m and -0.03 m. That is not a
+# marginal threshold call, which is why 2 m is a safe place to draw it.
+#
+# But the HEADROOM is a property of the neighbourhood, not of the method.
+# Altstetten's lowest real detection sits at 2.7 m -- industrial sheds and
+# treatment-plant structures are low buildings -- so the margin there is 0.7 m,
+# not Wiedikon's 8.9 m. In a genuinely low-rise area (carports, single-storey
+# garages, bungalows) this threshold would start clipping real rooftop arrays.
+# Check the height distribution before trusting this gate in a new city.
+MIN_HEIGHT_ABOVE_GROUND_M = 2.0
+
+# Above this a "roof" is a wall. Real roof pitches top out near 50 deg and
+# rack tilts near 40, so 60 leaves room for genuinely steep alpine roofs.
+MAX_PLAUSIBLE_TILT_DEG = 60.0
+
+
+def fetch_dtm_chip(bbox):
+    """Read the swissALTI3D DTM (bare terrain, no buildings or vegetation)
+    covering bbox, at its native 0.5 m.
+
+    Deliberately a separate function from fetch_dsm_chip() despite the shape
+    being nearly identical, because the asset selection differs in a way that
+    bites: every swissALTI3D item publishes BOTH a 0.5 m and a 2 m GeoTIFF, so
+    a match on ".tif" alone picks up both and mosaics two resolutions
+    together. The href pattern is swissalti3d_<year>_<tile>_<gsd>_2056_*.tif,
+    hence the explicit _0.5_ filter.
+    """
+    resp = requests.get(
+        "https://data.geo.admin.ch/api/stac/v1/search",
+        params={"collections": "ch.swisstopo.swissalti3d", "bbox": ",".join(str(b) for b in bbox)},
+    )
+    resp.raise_for_status()
+    items = resp.json()["features"]
+    items.sort(key=lambda i: i["properties"]["datetime"], reverse=True)
+    hrefs = []
+    for item in items:
+        href = next((v["href"] for k, v in item["assets"].items() if "_0.5_" in k and k.endswith(".tif")), None)
+        if href:
+            hrefs.append(href)
+    if not hrefs:
+        raise RuntimeError(f"No 0.5m swissALTI3D tiles found for bbox {bbox}")
+    years = sorted({i["properties"]["datetime"][:4] for i in items}, reverse=True)
+    print(f"DTM tiles covering bbox: {len(hrefs)} (acquisitions available: {', '.join(years)}; using newest first)")
+    datasets = [rasterio.open(h) for h in hrefs]
+    try:
+        mosaic, transform = merge_rasters(datasets)
+        crs = datasets[0].crs
+    finally:
+        for d in datasets:
+            d.close()
+    return mosaic[0], transform, crs
+
+
+def add_height_above_ground(arrays, image_transform, image_crs, dsm, dsm_transform, dsm_crs, dtm, dtm_transform, dtm_crs):
+    """Attach each array's median height above bare terrain, in metres.
+
+    Sampled from the raw segmentation mask rather than from the DSM window
+    add_roof_geometry() builds, so this does not depend on a plane having been
+    fitted -- a detection can fail to fit a plane and still be usefully
+    classified as sitting on the ground.
+    """
+    for a in arrays:
+        rows, cols = np.nonzero(a["mask"])
+        xs, ys = rasterio.transform.xy(image_transform, a["y0"] + rows, a["x0"] + cols)
+        xs, ys = np.asarray(xs), np.asarray(ys)
+
+        def median_at(raster, transform, crs):
+            px, py = (xs, ys) if image_crs == crs else rasterio.warp.transform(image_crs, crs, xs, ys)
+            r, c = rasterio.transform.rowcol(transform, px, py)
+            r, c = np.asarray(r), np.asarray(c)
+            inside = (r >= 0) & (r < raster.shape[0]) & (c >= 0) & (c < raster.shape[1])
+            v = raster[r[inside], c[inside]].astype(float)
+            v = v[np.isfinite(v) & (v > -1000)]  # nodata sentinel
+            return float(np.median(v)) if v.size >= 5 else None
+
+        surface = median_at(dsm, dsm_transform, dsm_crs)
+        terrain = median_at(dtm, dtm_transform, dtm_crs)
+        a["height_above_ground_m"] = None if surface is None or terrain is None else surface - terrain
+
+
+def apply_plausibility_gates(arrays):
+    """Flag detections that cannot be what the pipeline says they are.
+
+    NOTHING IS DELETED. Both gates have real exceptions -- ground-mounted PV
+    is genuinely at grade (SF's Sunset Reservoir farm, this project's original
+    positive control, is ground-mounted on a reservoir cover), and
+    facade-mounted PV is genuinely near-vertical. A flag lets a downstream
+    consumer decide; a silent drop would quietly delete real capacity, which
+    is the one direction an aggregate MW total cannot afford to be wrong in.
+    """
+    for a in arrays:
+        h = a.get("height_above_ground_m")
+        tilt = a.get("tilt_deg")
+        a["at_grade"] = h is not None and h < MIN_HEIGHT_ABOVE_GROUND_M
+        a["implausible_tilt"] = tilt is not None and tilt > MAX_PLAUSIBLE_TILT_DEG
+        a["no_height"] = h is None
+        a["plausible"] = not (a["at_grade"] or a["implausible_tilt"])
+
+    at_grade = [a for a in arrays if a["at_grade"]]
+    steep = [a for a in arrays if a["implausible_tilt"]]
+    unknown = [a for a in arrays if a["no_height"]]
+    kept = [a for a in arrays if a["plausible"]]
+
+    print(f"\nPlausibility gates ({len(arrays)} detections in):")
+    print(f"  at grade (< {MIN_HEIGHT_ABOVE_GROUND_M:.0f} m above bare terrain): {len(at_grade)}")
+    for a in at_grade:
+        print(f"      {a['pv_area_m2']:.0f} m^2  p_pv={a['p_pv']:.3f}  "
+              f"height={a['height_above_ground_m']:+.2f} m  at ({a['centroid_lat']:.5f},{a['centroid_lon']:.5f})")
+    print(f"  tilt > {MAX_PLAUSIBLE_TILT_DEG:.0f} deg (a wall, not a roof): {len(steep)}")
+    for a in steep:
+        print(f"      {a['pv_area_m2']:.0f} m^2  p_pv={a['p_pv']:.3f}  tilt={a['tilt_deg']:.1f} deg")
+    if unknown:
+        print(f"  height could not be measured (no DSM/DTM coverage): {len(unknown)}")
+    area_all = sum(a["pv_area_m2"] for a in arrays)
+    area_kept = sum(a["pv_area_m2"] for a in kept)
+    print(f"  -> {len(kept)} plausible, {len(arrays) - len(kept)} flagged "
+          f"({area_kept:.0f} of {area_all:.0f} m^2 kept, {100 * (1 - area_kept / area_all):.1f}% flagged out)")
+    print("  (flagged, not deleted -- ground-mounted and facade PV are real; see apply_plausibility_gates)")
+    return kept
 
 
 def fit_roof_plane(elevation, transform, footprint_mask=None):
@@ -1490,6 +1620,14 @@ def main():
         dsm_elevation, dsm_transform, dsm_crs = fetch_dsm_chip(bbox)
         add_roof_geometry(arrays, transform, dsm_elevation, dsm_transform, crs, dsm_crs)
 
+        print("\nFetching swissALTI3D terrain model for the ground gate...")
+        dtm_elevation, dtm_transform, dtm_crs = fetch_dtm_chip(bbox)
+        add_height_above_ground(
+            arrays, transform, crs, dsm_elevation, dsm_transform, dsm_crs,
+            dtm_elevation, dtm_transform, dtm_crs,
+        )
+        plausible = apply_plausibility_gates(arrays)
+
         print("\nDetected PV arrays -- location, size, and fitted roof geometry:")
         for a in arrays:
             notes = []
@@ -1497,19 +1635,21 @@ def main():
                 notes.append(f"stitched from {a['n_tiles']} tiles")
             if a["possibly_truncated"]:
                 notes.append("may be cut short at a seam")
+            if a["at_grade"]:
+                notes.append(f"AT GRADE {a['height_above_ground_m']:+.1f} m -- not a roof")
+            if a["implausible_tilt"]:
+                notes.append("IMPLAUSIBLE TILT -- a wall, not a roof")
             note = f"  [{'; '.join(notes)}]" if notes else ""
+            height = a["height_above_ground_m"]
+            h_str = "  h=  ?  " if height is None else f"  h={height:6.1f}m"
+            head = (
+                f"  p_pv={a['p_pv']:.3f}  area={a['pv_area_m2']:6.0f}m^2  "
+                f"lat={a['centroid_lat']:.6f}  lon={a['centroid_lon']:.6f}{h_str}"
+            )
             if a["tilt_deg"] is None:
-                print(
-                    f"  p_pv={a['p_pv']:.3f}  area={a['pv_area_m2']:.0f}m^2  "
-                    f"lat={a['centroid_lat']:.6f}  lon={a['centroid_lon']:.6f}  "
-                    f"(footprint too small to fit a plane){note}"
-                )
+                print(f"{head}  (footprint too small to fit a plane){note}")
             else:
-                print(
-                    f"  p_pv={a['p_pv']:.3f}  area={a['pv_area_m2']:.0f}m^2  "
-                    f"lat={a['centroid_lat']:.6f}  lon={a['centroid_lon']:.6f}  "
-                    f"tilt={a['tilt_deg']:.1f}deg  azimuth={a['azimuth_deg']:.0f}deg{note}"
-                )
+                print(f"{head}  tilt={a['tilt_deg']:.1f}deg  azimuth={a['azimuth_deg']:.0f}deg{note}")
                 if len(a["roof_planes"]) > 1 or a["roof_planes"][0]["n_outliers_rejected"] > 0:
                     for i, plane in enumerate(a["roof_planes"]):
                         outlier_note = f"  ({plane['n_outliers_rejected']} outlier px rejected)" if plane["n_outliers_rejected"] else ""
@@ -1521,9 +1661,12 @@ def main():
         save_detection_cache(arrays, transform, crs, f"data/level3_cv_{mode}_detections.npz", tile_results=results)
 
         location_label = "Altstetten, Zurich" if mode == "altstetten" else "Wiedikon, Zurich"
-        save_roof_geometry_windrose(arrays, f"data/level3_cv_{mode}_roof_geometry.png", location_label)
+        # the wind-rose plots only what survived the gates: a single 66 deg
+        # "roof" sets the radial scale for every other point on the plot, so
+        # leaving flagged detections in makes the real spread unreadable
+        save_roof_geometry_windrose(plausible, f"data/level3_cv_{mode}_roof_geometry.png", location_label)
 
-        fitted = [a for a in arrays if a.get("tilt_deg") is not None]
+        fitted = [a for a in plausible if a.get("tilt_deg") is not None]
         if fitted:
             best = max(fitted, key=lambda a: a["p_pv"])
             save_building_detail(best, image, transform, f"data/level3_cv_{mode}_building_detail.png")

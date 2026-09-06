@@ -62,13 +62,15 @@ def main():
 
     dets = []
     for i in range(n):
-        p_pv, y0, x0, area, lat, lon, tilt, az, n_tiles, truncated = cache[f"meta_{i}"]
+        (p_pv, y0, x0, area, lat, lon, tilt, az, n_tiles, truncated,
+         height, at_grade, bad_tilt) = cache[f"meta_{i}"]
         mask = cache[f"mask_{i}"].astype(bool)
         if mask.sum() == 0:
             continue
         dets.append(dict(i=i, p_pv=p_pv, y0=int(y0), x0=int(x0), area=area,
                          lat=lat, lon=lon, tilt=tilt, az=az, mask=mask,
-                         n_tiles=int(n_tiles), truncated=bool(truncated)))
+                         n_tiles=int(n_tiles), truncated=bool(truncated),
+                         height=height, at_grade=bool(at_grade), bad_tilt=bool(bad_tilt)))
     dets.sort(key=lambda d: -d["area"])
     print(f"{mode}: {n} detections cached, {len(dets)} with PV pixels")
 
@@ -99,8 +101,19 @@ def main():
         if d["truncated"]:
             seam.append("cut at seam?")
         seam_s = f"   [{', '.join(seam)}]" if seam else ""
-        ax.set_title(f"p={d['p_pv']:.3f}   {d['area']:.0f} m²   tilt/az={tilt_s}\n"
-                     f"{crop[2]-crop[0]:.0f} m across{seam_s}", fontsize=10)
+        h_s = "h=?" if np.isnan(d["height"]) else f"h={d['height']:.0f}m"
+        flags = []
+        if d["at_grade"]:
+            flags.append("AT GRADE")
+        if d["bad_tilt"]:
+            flags.append("TILT>60")
+        # a flagged detection gets a red title, so it is obvious which panels
+        # the gates would exclude without having to cross-reference the console
+        colour = "#c0392b" if flags else "black"
+        flag_s = ("   ** " + " + ".join(flags) + " **") if flags else ""
+        ax.set_title(f"p={d['p_pv']:.3f}   {d['area']:.0f} m²   tilt/az={tilt_s}   {h_s}\n"
+                     f"{crop[2]-crop[0]:.0f} m across{seam_s}{flag_s}",
+                     fontsize=10, color=colour)
         ax.set_xticks([]); ax.set_yticks([])
         print(f"  p={d['p_pv']:.3f} {d['area']:.0f}m2 {crop[2]-crop[0]:.0f}m crop")
 
