@@ -223,6 +223,27 @@ against the cached detections (`data/level3_cv_*_detections.npz`) before being w
   Each record now also carries `n_tiles` and `possibly_truncated` (blob edge runs into a tile that
   was never segmented — the case stitching cannot fix; needs overlapping inference at stride <
   `TILE_PX`. Currently 4 arrays in each test area).
+- **Gap bridging — one roof is one array. FIXED 2026-09-07** (commit `655e49e`). Stitching removed
+  the *tile* as an artificial divider but left pixel adjacency as the definition of "one array",
+  which is too strict: the segmenter drops out across walkways, shadow and its own uncertainty, and
+  on the Wiedikon test roof that split one array into three detections whose nearest mask pixels were
+  1.5, 4.3 and 7.2 m apart (Christian spotted it by eye — three panels of the same building presented
+  as three buildings). Labelling now runs over a morphologically closed copy of the canvas
+  (`bridge_mask_gaps()`, dilate then erode by `GAP_BRIDGE_PX`).
+  **The closed canvas decides grouping ONLY** — every returned mask is cut back to the pixels the
+  segmenter actually called panel. If the bridged gaps counted as panels, every area and every
+  capacity estimate built on one would be inflated by the walkways between rows. **The invariant is
+  that total panel area is identical at every radius including zero**, and it holds: Wiedikon
+  3021.8 m² before and after, to the decimal. (Altstetten reads 6779.8 vs 6778.9 — that is one
+  16 px fragment which used to fall below the 30 px size floor and now gets bridged into a
+  neighbour, so a recovery, not a leak. Verified: 1 blob dropped before, 0 after.)
+  **The radius came off a measured plateau, not a preference.** Sweeping 0–30 px against the cached
+  masks of both areas, the count is stable from **9 px through 16 px in both** (Wiedikon 16 arrays,
+  Altstetten 8) and only merges further at 21 px in Altstetten and 30 px in Wiedikon. 12 px (2.8 m)
+  sits in the middle of the range where the two independently agree. Same shape of reasoning as the
+  2 m ground gate: look for the flat region before arguing about the value.
+  **Effect:** Wiedikon 24 → 16 detections (6 assembled across gaps), Altstetten 14 → 7 (4 across
+  gaps). The three pieces on the Wiedikon roof are now one 1968 m² array.
 - **~~`pv_area_m2` and `tilt_deg` describe different objects.~~ FIXED by the same change.** Area
   used to sum the whole tile mask across every building in it while tilt came from `planes[0]`, the
   largest connected facet of that pile. Each record is now one contiguous blob, so both describe the
