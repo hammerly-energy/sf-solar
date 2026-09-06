@@ -204,15 +204,29 @@ against the cached detections (`data/level3_cv_*_detections.npz`) before being w
   degrees. `MAX_OUTLIER_FRACTION = 0.2` makes this worse by switching the estimator between trimmed
   and untrimmed as a function of size, so trimmed and untrimmed tilts are pooled in every plot and
   claim despite being different estimators. **Plot tilt vs area on every run.**
-- **A "detection" is a tile, not an array.** `tile_chip()` uses stride == tile size, so a large array
-  is cut at seams and each piece becomes an independent detection with its own area, centroid and
-  plane fit. **12 of 13 Altstetten detections** and 3 of 19 Wiedikon detections belong to a mask
-  component that crosses a seam. This gives a free, ground-truth-free regression test — two fragments
-  of one contiguous surface must return the same plane — and it currently **fails**: median azimuth
-  disagreement 84°, max **179°**; max tilt disagreement 9.16°.
-- **`pv_area_m2` and `tilt_deg` describe different objects.** Area sums the whole tile mask across
-  every building in it; tilt comes from `planes[0]`, the single largest connected facet. A 256px tile
-  at 0.2359 m/px is 60m across — several buildings in dense Zurich.
+  **Still present after the 2026-09-06 stitching fix**, which was never going to touch it: Wiedikon
+  ρ = **−0.436, n=24, p=0.033**, median tilt **12.6° under 120 m²** vs **1.0° at or above**, and two
+  impossible roofs survive at **66.3°** (43 m²) and **60.9°** (17 m²). Altstetten's ρ = −0.165
+  (p=0.57) is still range-restricted, and its whole fleet now reads 0.0–3.6°.
+- **~~A "detection" is a tile, not an array.~~ FIXED 2026-09-06** (commit `7f2e475`).
+  `find_pv_arrays()` now stitches every flagged tile's mask into one full-image canvas and runs a
+  single connected-component pass over the whole thing, returning one record per contiguous blob.
+  Records keep the same `(mask, y0, x0, pixels)` contract, reinterpreted as the blob's bounding box,
+  so `add_roof_geometry()` / `save_detection_cache()` / `audit_detections.py` needed no changes.
+  **Effect, Altstetten:** 13 detections (12 of them seam fragments) → **14 arrays assembled from 24
+  tile-level pieces, 7 spanning more than one tile**, and the tilt range collapsed from "0.0–1.4°
+  plus apparent exceptions at 5.7° and 10.2°" to **0.0–3.6°**. Those two exceptions were seam
+  artifacts, now confirmed by merging — the pipeline was producing them, not the roofs.
+  **Effect, Wiedikon:** 14 records → 24 arrays from 26 pieces; the 1462 m² industrial array is one
+  detection instead of three. The count went *up* because the old code also lumped several separate
+  buildings in one tile into a single record — see the next bullet.
+  Each record now also carries `n_tiles` and `possibly_truncated` (blob edge runs into a tile that
+  was never segmented — the case stitching cannot fix; needs overlapping inference at stride <
+  `TILE_PX`. Currently 4 arrays in each test area).
+- **~~`pv_area_m2` and `tilt_deg` describe different objects.~~ FIXED by the same change.** Area
+  used to sum the whole tile mask across every building in it while tilt came from `planes[0]`, the
+  largest connected facet of that pile. Each record is now one contiguous blob, so both describe the
+  same object.
 - **Segmentation badly under-covers large true positives.** On the 1322 m² and 584 m² arrays the masks
   trace narrow strips across roofs that are panel-covered edge to edge.
 
