@@ -41,6 +41,19 @@ def fetch_native_crop(bounds_2056):
     return np.transpose(data, (1, 2, 0))
 
 
+def draw_mask_outline(ax, mask, extent, **kwargs):
+    """Closed outline of a boolean mask. contour() cannot close a line that
+    runs off the edge of its array, and a blob's bounding box has mask pixels
+    on all four edges by definition -- so pad a ring of False around it and
+    widen the extent by that same pixel to keep the geometry aligned."""
+    left, right, bottom, top = extent
+    px = (right - left) / mask.shape[1]
+    py = (top - bottom) / mask.shape[0]
+    ax.contour(np.pad(mask, 1).astype(float), levels=[0.5],
+               extent=(left - px, right + px, bottom - py, top + py),
+               origin="upper", **kwargs)
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "zurich"
     cache = np.load(f"data/level3_cv_{mode}_detections.npz")
@@ -69,14 +82,16 @@ def main():
         # tile extent in EPSG:2056 metres
         left, top = transform * (d["x0"], d["y0"])
         right, bottom = transform * (d["x0"] + w, d["y0"] + h)
-        # pad outward so context around the array is visible
-        pad = 0.25 * max(right - left, top - bottom)
+        # pad outward so context around the array is visible. The proportional
+        # term alone leaves small arrays cropped flush to their own edge, so
+        # there is an absolute floor too (must match CONTEXT_MARGIN_* in
+        # level3_cv_detection.py).
+        pad = max(0.35 * max(right - left, top - bottom), 10.0)
         crop = (left - pad, bottom - pad, right + pad, top + pad)
         img = fetch_native_crop(crop)
         ax.imshow(img, extent=(crop[0], crop[2], crop[1], crop[3]), origin="upper")
-        ax.contour(d["mask"].astype(float), levels=[0.5],
-                   extent=(left, right, bottom, top), origin="upper",
-                   colors="#eb6834", linewidths=2.0)
+        draw_mask_outline(ax, d["mask"], (left, right, bottom, top),
+                          colors="#eb6834", linewidths=2.0)
         tilt_s = "--" if np.isnan(d["tilt"]) else f"{d['tilt']:.1f}/{d['az']:.0f}"
         seam = []
         if d["n_tiles"] > 1:

@@ -575,10 +575,11 @@ def save_detection_cache(arrays, image_transform, image_crs, output_path):
 MAX_OVERLAY_PANELS = 12
 
 
-def save_segmentation_overlays(arrays, output_path):
-    """One panel per detected array, largest first. Each panel is that array's
-    own bounding box, so panels differ in size and shape -- they are arrays
-    now, not uniform tiles."""
+def save_segmentation_overlays(arrays, image, image_transform, output_path):
+    """One panel per detected array, largest first, each cropped to that
+    array plus a margin of surrounding roof -- so panels differ in size and
+    shape (they are arrays now, not uniform tiles) but you can still see what
+    the mask stopped short of."""
     import matplotlib.pyplot as plt
 
     if not arrays:
@@ -591,11 +592,14 @@ def save_segmentation_overlays(arrays, output_path):
     fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4.5 * nrows))
     axes = np.atleast_1d(axes).ravel()
     for ax, a in zip(axes, shown):
-        img = np.transpose(a["pixels"], (1, 2, 0))
-        ax.imshow(img)
-        overlay = np.zeros((*a["mask"].shape, 4))
-        overlay[a["mask"]] = [1, 1, 0, 0.5]  # yellow, semi-transparent
-        ax.imshow(overlay)
+        rgb, mask_crop, _ = crop_around_array(
+            a, image, image_transform, array_bounds_with_margin(a, image_transform)
+        )
+        ax.imshow(rgb)
+        # outline, not a fill -- a translucent fill hides exactly the roof
+        # texture you need to tell a PV module from a skylight
+        h, w = mask_crop.shape
+        draw_mask_outline(ax, mask_crop, (-0.5, w - 0.5, h - 0.5, -0.5), colors="#eb6834", linewidths=1.6)
         seam_note = f", {a['n_tiles']} tiles" if a["n_tiles"] > 1 else ""
         ax.set_title(f"p_pv={a['p_pv']:.3f}{seam_note}\n{a['pv_area_m2']:.0f} m^2 panel area", fontsize=9)
         ax.set_xticks([])
@@ -973,6 +977,46 @@ def save_roof_geometry_windrose(arrays, output_path, location_label="Wiedikon, Z
     print(f"Saved roof geometry wind-rose to {output_path}")
 
 
+# How much roof to show around a detected array. A blob's bounding box stops
+# at its last panel pixel, so without a margin every plot is cropped flush to
+# the array and there is nothing left to judge it against. Proportional alone
+# is not enough -- 25% of a 5 m^2 blob is about a metre -- hence the floor.
+CONTEXT_MARGIN_FRAC = 0.35
+CONTEXT_MARGIN_MIN_M = 10.0
+
+
+def array_bounds_with_margin(array, image_transform):
+    """The array's bounding box in CRS coords, grown by a visible margin.
+    Returns (left, bottom, right, top)."""
+    h, w = array["mask"].shape
+    left, top = image_transform * (array["x0"], array["y0"])
+    right, bottom = image_transform * (array["x0"] + w, array["y0"] + h)
+    pad = max(CONTEXT_MARGIN_FRAC * max(right - left, top - bottom), CONTEXT_MARGIN_MIN_M)
+    return left - pad, bottom - pad, right + pad, top + pad
+
+
+def draw_mask_outline(ax, mask, extent, **kwargs):
+    """Draw a boolean mask's boundary as a CLOSED outline.
+
+    matplotlib's contour() will not close a contour that runs off the edge of
+    the array it is given -- it has no data beyond the edge to place the line
+    against. A blob's bounding box has mask pixels touching all four edges by
+    definition, so contouring one directly leaves the outline hanging open
+    wherever the array reaches its own edge. Padding a ring of False around
+    the mask, and widening the extent by that same one pixel so the geometry
+    still lines up with the image underneath, gives the contour somewhere to
+    close. `extent` is matplotlib's (left, right, bottom, top).
+    """
+    left, right, bottom, top = extent
+    px = (right - left) / mask.shape[1]
+    py = (top - bottom) / mask.shape[0]
+    ax.contour(
+        np.pad(mask, 1).astype(float), levels=[0.5],
+        extent=(left - px, right + px, bottom - py, top + py),
+        origin="upper", **kwargs,
+    )
+
+
 def crop_around_array(array, image, image_transform, bounds):
     """RGB crop of the FULL image over `bounds` (left, bottom, right, top in
     the image CRS), with this array's blob mask pasted into the same frame.
@@ -1036,14 +1080,8 @@ def save_building_detail(array, image, image_transform, output_path):
 
     fig = plt.figure(figsize=(13, 6.5))
 
-    # pad outward from the blob's own (tight) bounding box so the roof around
-    # the array is visible, not just the panels themselves
-    mh, mw = array["mask"].shape
-    box_left, box_top = image_transform * (array["x0"], array["y0"])
-    box_right, box_bottom = image_transform * (array["x0"] + mw, array["y0"] + mh)
-    pad = 0.25 * max(box_right - box_left, box_top - box_bottom)
     rgb, mask_crop, _ = crop_around_array(
-        array, image, image_transform, (box_left - pad, box_bottom - pad, box_right + pad, box_top + pad)
+        array, image, image_transform, array_bounds_with_margin(array, image_transform)
     )
 
     ax1 = fig.add_subplot(1, 2, 1)
@@ -1143,7 +1181,7 @@ def save_registration_check(array, image, image_transform, output_path, margin_m
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
 
     ax1.imshow(rgb_crop, extent=to_extent(rgb_bounds), origin="upper")
-    ax1.contour(mask_crop.astype(float), levels=[0.5], extent=to_extent(rgb_bounds), origin="upper", colors="#eda100", linewidths=2)
+    draw_mask_outline(ax1, mask_crop, to_extent(rgb_bounds), colors="#eda100", linewidths=2)
     ax1.set_title("SWISSIMAGE orthophoto\n+ segmentation mask outline")
     ax1.set_xlabel("East-West (m)")
     ax1.set_ylabel("North-South (m)")
@@ -1151,9 +1189,9 @@ def save_registration_check(array, image, image_transform, output_path, margin_m
     im = ax2.imshow(
         dsm_window, cmap=cmap, extent=to_extent((dsm_left, dsm_bottom, dsm_right, dsm_top)), origin="upper"
     )
-    ax2.contour(
-        array["dsm_footprint_mask"].astype(float), levels=[0.5],
-        extent=to_extent((dsm_left, dsm_bottom, dsm_right, dsm_top)), origin="upper", colors="#eda100", linewidths=2,
+    draw_mask_outline(
+        ax2, array["dsm_footprint_mask"], to_extent((dsm_left, dsm_bottom, dsm_right, dsm_top)),
+        colors="#eda100", linewidths=2,
     )
     ax2.set_title("swissSURFACE3D DSM height\n+ SAME mask outline")
     ax2.set_xlabel("East-West (m)")
@@ -1220,7 +1258,7 @@ def save_outlier_check(array, image, image_transform, output_path, margin_m=3):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
 
     ax1.imshow(rgb_crop, extent=to_extent(rgb_bounds), origin="upper")
-    ax1.contour(mask_crop.astype(float), levels=[0.5], extent=to_extent(rgb_bounds), origin="upper", colors="#eda100", linewidths=1.5)
+    draw_mask_outline(ax1, mask_crop, to_extent(rgb_bounds), colors="#eda100", linewidths=1.5)
     ax1.scatter(rej_x_local, rej_y_local, color="#d03b3b", marker="x", s=60, linewidths=2, zorder=5, label="Rejected outlier")
     ax1.set_title("SWISSIMAGE orthophoto\n+ rejected outlier locations")
     ax1.set_xlabel("East-West (m)")
@@ -1230,9 +1268,9 @@ def save_outlier_check(array, image, image_transform, output_path, margin_m=3):
     im = ax2.imshow(
         dsm_window, cmap=cmap, extent=to_extent((dsm_left, dsm_bottom, dsm_right, dsm_top)), origin="upper"
     )
-    ax2.contour(
-        array["dsm_footprint_mask"].astype(float), levels=[0.5],
-        extent=to_extent((dsm_left, dsm_bottom, dsm_right, dsm_top)), origin="upper", colors="#eda100", linewidths=1.5,
+    draw_mask_outline(
+        ax2, array["dsm_footprint_mask"], to_extent((dsm_left, dsm_bottom, dsm_right, dsm_top)),
+        colors="#eda100", linewidths=1.5,
     )
     ax2.scatter(rej_x_local, rej_y_local, facecolors="none", edgecolors="#d03b3b", marker="o", s=100, linewidths=2, zorder=5)
     ax2.set_title(f"swissSURFACE3D DSM height\n+ {n_rejected} rejected outlier px (>{OUTLIER_RESIDUAL_M * 100:.0f}cm from fit)")
@@ -1407,7 +1445,7 @@ def main():
     if mode in ZURICH_MODES:
         print("\nRunning segmentation on plausible-PV tiles...")
         arrays = find_pv_arrays(image, tiles, results, transform, crs, threshold=0.2)
-        save_segmentation_overlays(arrays, f"data/level3_cv_{mode}_segmentation.png")
+        save_segmentation_overlays(arrays, image, transform, f"data/level3_cv_{mode}_segmentation.png")
 
         print("\nFetching swissSURFACE3D DSM for roof-plane fitting...")
         dsm_elevation, dsm_transform, dsm_crs = fetch_dsm_chip(bbox)
