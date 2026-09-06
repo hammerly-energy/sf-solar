@@ -449,9 +449,46 @@ def combine_tile_confidence(pixel_confidences):
     return float(np.mean(pixel_confidences))
 
 
-def _pad_slice(sl, shape, pad=1):
-    """Grow a 2-D bounding-box slice by `pad` pixels, clipped to the array."""
-    return tuple(slice(max(s.start - pad, 0), min(s.stop + pad, dim)) for s, dim in zip(sl, shape))
+# Panel pixels a few metres apart belong to the same installation, not to two.
+# The segmenter drops out across walkways, shadow and its own uncertainty, and
+# on the Wiedikon test roof that split one array into three detections whose
+# nearest mask pixels were 1.5, 4.3 and 7.2 m apart. Closing the canvas
+# (dilate, then erode by the same amount) bridges gaps up to roughly this
+# radius before the connected-component pass decides what "one array" means.
+#
+# 12 px = 2.8 m, taken off a measured plateau rather than picked by eye:
+# sweeping the radius over both test areas, the detection count is stable from
+# 9 px through 16 px in BOTH (Wiedikon 16 arrays, Altstetten 8), and only
+# starts merging further at 21 px in Altstetten and 30 px in Wiedikon. 12 sits
+# in the middle of the range where the two areas agree.
+#
+# CRITICAL: the closed canvas decides GROUPING ONLY. Every returned mask is
+# still the original segmented pixels. If the bridged gaps counted as panels,
+# every area -- and so every capacity estimate built on one -- would be
+# inflated by the walkways between rows. The invariant is that total panel
+# area is IDENTICAL at every radius including zero; it held exactly (3021.8 m^2
+# Wiedikon, 6778.9 m^2 Altstetten) across 0-30 px when this was chosen.
+GAP_BRIDGE_PX = 12
+
+
+def bridge_mask_gaps(canvas, radius_px):
+    """Morphological closing of the panel canvas: dilate by radius_px, then
+    erode by the same. Small gaps get filled; the outer boundary comes back
+    to roughly where it started.
+
+    Used only to decide which pixels belong to the same array -- never
+    returned as a mask. See GAP_BRIDGE_PX.
+    """
+    from scipy import ndimage
+
+    if radius_px <= 0:
+        return canvas
+    # pad first, or the erosion pass eats the mask back at the array border
+    pad = radius_px + 1
+    padded = np.pad(canvas, pad)
+    grown = ndimage.binary_dilation(padded, structure=np.ones((3, 3)), iterations=radius_px)
+    shrunk = ndimage.binary_erosion(grown, structure=np.ones((3, 3)), iterations=radius_px)
+    return shrunk[pad:-pad, pad:-pad]
 
 
 def find_pv_arrays(image, tiles, results, transform, crs, threshold=0.2):
@@ -511,42 +548,62 @@ def find_pv_arrays(image, tiles, results, transform, crs, threshold=0.2):
 
     # ONE connected-component pass over the whole canvas. Panel pixels either
     # side of a seam are literally adjacent here, so they join into one blob
-    # and the tile boundary stops existing.
-    labels, n_blobs = ndimage.label(canvas, structure=np.ones((3, 3)))
+    # and the tile boundary stops existing. Labelling runs over the CLOSED
+    # canvas so that a few metres of segmentation dropout does not split one
+    # roof into several arrays -- but every mask below is cut back to the
+    # pixels actually segmented as panels.
+    grouping = bridge_mask_gaps(canvas, GAP_BRIDGE_PX)
+    labels, n_blobs = ndimage.label(grouping, structure=np.ones((3, 3)))
+
+    # a panel pixel sitting next to territory the segmenter never looked at may
+    # be an array cut short at a seam. Computed once here rather than per blob.
+    boundary_of_segmented = ndimage.binary_dilation(~segmented, structure=np.ones((3, 3))) & segmented
 
     arrays = []
     n_dropped = 0
     n_pieces = 0
+    n_bridged = 0
     for blob_id, sl in enumerate(ndimage.find_objects(labels), start=1):
         if sl is None:
             continue
-        sub = labels[sl] == blob_id
-        n_px = int(sub.sum())
+        # the label came from the closed canvas -- keep only pixels the
+        # segmenter actually called panel, so area stays honest
+        pixels = (labels[sl] == blob_id) & canvas[sl]
+        n_px = int(pixels.sum())
         if n_px < MIN_BLOB_PX:
             n_dropped += 1
             continue
 
-        y0, x0 = sl[0].start, sl[1].start
+        # trim the box back to those pixels; the closed blob's box is up to
+        # GAP_BRIDGE_PX larger on every side
+        rr, cc = np.nonzero(pixels)
+        r0, r1, c0, c1 = rr.min(), rr.max() + 1, cc.min(), cc.max() + 1
+        sub = pixels[r0:r1, c0:c1]
+        y0, x0 = sl[0].start + r0, sl[1].start + c0
+        box = (slice(y0, y0 + sub.shape[0]), slice(x0, x0 + sub.shape[1]))
+
+        n_separate_pieces = ndimage.label(sub, structure=np.ones((3, 3)))[1]
+        if n_separate_pieces > 1:
+            n_bridged += 1
+
         rows, cols = np.nonzero(sub)
         utm_x, utm_y = rasterio.transform.xy(transform, y0 + rows.mean(), x0 + cols.mean())
         centroid_lon, centroid_lat = rasterio.warp.transform(crs, "EPSG:4326", [utm_x], [utm_y])
 
-        pixel_tiles = tile_index[sl][sub]
+        pixel_tiles = tile_index[box][sub]
         contributing = np.unique(pixel_tiles)
         n_pieces += len(contributing)
 
-        # did this blob stop at the edge of the segmented area? if so it may
-        # be a real array cut short, not a complete one -- overlapping
-        # inference (stride < TILE_PX) is what would fix that, not stitching
-        psl = _pad_slice(sl, canvas.shape)
-        grown = ndimage.binary_dilation(labels[psl] == blob_id, structure=np.ones((3, 3)))
-        truncated = bool((grown & ~segmented[psl]).any())
+        # a real array cut short at a seam, rather than a complete one --
+        # overlapping inference (stride < TILE_PX) is what would fix that
+        truncated = bool((sub & boundary_of_segmented[box]).any())
 
         arrays.append(
             {
                 "p_pv": combine_tile_confidence(tile_conf[pixel_tiles]),
                 "tile_p_pv": tile_conf[contributing],
                 "n_tiles": len(contributing),
+                "n_mask_pieces": n_separate_pieces,
                 "possibly_truncated": truncated,
                 "mask": sub,
                 "pixels": image[:, sl[0], sl[1]],
@@ -565,6 +622,11 @@ def find_pv_arrays(image, tiles, results, transform, crs, threshold=0.2):
     print(f"Stitched into {len(arrays)} arrays ({n_dropped} blobs dropped as smaller than ~1 module)")
     print(f"  assembled from {n_pieces} tile-level pieces; {n_multi} arrays span more than one tile")
     print(f"  {n_trunc} run up against a tile that was never segmented -- possibly cut short at a seam")
+    print(f"  {n_bridged} were assembled across gaps of up to {GAP_BRIDGE_PX * TARGET_MPP:.1f} m "
+          f"in the segmentation (would have been separate detections without gap bridging)")
+    total_area = sum(a["pv_area_m2"] for a in arrays)
+    dropped_area = (int(canvas.sum()) - sum(a["pv_pixel_count"] for a in arrays)) * TARGET_MPP**2
+    print(f"  total panel area {total_area:.1f} m^2 (+{dropped_area:.1f} m^2 in blobs below the size floor)")
     return arrays
 
 
