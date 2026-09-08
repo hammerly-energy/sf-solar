@@ -156,7 +156,22 @@ Verified against the live STAC API; recorded here because the code still has the
 
 Backup candidates if Zurich hits a wall: Netherlands (PDOK/AHN, 25cm ortho + 6–10 pts/m² LiDAR, fully open) and Massachusetts, USA (MassGIS, 15cm ortho + QL1/QL2 LiDAR with DSM, public domain). Note both are *lower* density than the swissSURFACE3D point cloud (28.7 pts/m²) — there's no resolution argument for switching regions; the densest data we've found is already where we're working.
 
-Prototype code: `scripts/level3_cv_detection.py` (explicitly marked experimental, not part of the main pipeline). Model weights live in `data/raw/deepsolar_weights/` (gitignored, ~1.2GB — re-download via `gdown` from the Google Drive link in the DeepSolar-3M GitHub README if missing). Run with:
+**`cv` in filenames means computer vision** — the imagery-based detection branch. It was never spelled
+out anywhere until 2026-09-08; don't let a new abbreviation into this repo without expanding it once.
+
+Prototype code, two files (split 2026-09-08 by dependency, not by topic — the point is that the half
+where the silent-wrongness bugs live can be tested without the model stack):
+
+- **`scripts/roof_geometry.py`** — orientation, footprint regularization, plane fitting, the view vote,
+  plausibility gates, the registration NCC. **numpy + scipy + rasterio only, no torch.** Tests are
+  `scripts/test_roof_geometry.py`, which runs in seconds:
+  `uv run --isolated --with numpy --with scipy --with rasterio python scripts/test_roof_geometry.py`
+  (24 checks, all passing; coverage is PARTIAL — `fit_roof_plane()` produces the tilt and azimuth this
+  project depends on and still has no unit test.)
+- **`scripts/level3_cv_detection.py`** — the pipeline: bboxes, fetching, model loading, tiling,
+  `find_pv_arrays()`, `add_roof_geometry()`, all the plotting, `main()`. Imports from `roof_geometry`.
+
+Both explicitly experimental, not part of the main pipeline. Model weights live in `data/raw/deepsolar_weights/` (gitignored, ~1.2GB — re-download via `gdown` from the Google Drive link in the DeepSolar-3M GitHub README if missing). Run with:
 ```
 uv run --isolated --with "torch>=2.3" --with transformers==4.46.3 --with rasterio \
   --with pystac-client --with planetary-computer --with matplotlib --with requests --with scipy \
@@ -181,7 +196,7 @@ sf-solar/
 ├── CLAUDE.md
 ├── README.md
 ├── docs/            # architecture + roadmap
-├── scripts/         # standalone Python steps
+├── scripts/         # standalone Python steps (+ roof_geometry.py, imported by the CV pipeline)
 ├── data/
 │   ├── raw/         # gitignored
 │   └── latest.json  # published output

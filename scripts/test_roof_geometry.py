@@ -1,11 +1,15 @@
-"""Unit tests for footprint regularization, on synthetic shapes with known answers.
+"""Unit tests for scripts/roof_geometry.py, on synthetic shapes with known answers.
 
-Run standalone (same isolated env as the pipeline -- level3_cv_detection.py
-imports torch at module level, so importing two numpy functions out of it pulls
-in the whole stack; not worth restructuring the flat script over):
-    uv run --isolated --with "torch>=2.3" --with transformers==4.46.3 --with rasterio \
-      --with pystac-client --with planetary-computer --with matplotlib --with requests \
-      --with scipy python scripts/test_regularize_footprint.py
+Run standalone -- three libraries, seconds, no model stack:
+    uv run --isolated --with numpy --with scipy --with rasterio \
+      python scripts/test_roof_geometry.py
+
+COVERAGE IS PARTIAL. These exercise dominant_orientation_deg() and
+regularize_footprint(). The rest of the module -- fit_roof_plane(),
+fit_group_planes(), apply_plausibility_gates(), check_registration_offset(),
+combine_views() -- is still only covered by running the pipeline and looking
+at the plots. fit_roof_plane() in particular produces the tilt and azimuth
+this whole project depends on and has no unit test at all.
 
 Every shape here is built by hand, so the right answer is known before the
 model sees it. That is the point: on the real detections there is no ground
@@ -20,7 +24,7 @@ import numpy as np
 from scipy import ndimage
 
 sys.path.insert(0, "scripts")
-from level3_cv_detection import (  # noqa: E402
+from roof_geometry import (  # noqa: E402
     TARGET_MPP,
     dominant_orientation_deg,
     footprint_change,
