@@ -66,6 +66,31 @@ TARGET_MPP = 0.2359
 NAIP_NATIVE_MPP = 0.6
 TILE_PX = 256
 
+# How far the tile window moves between positions.
+#
+# At TILE_PX the tiles form a PARTITION: every pixel is classified and
+# segmented exactly once, and a pixel near a tile edge gets the model's worst
+# possible view of it -- little surrounding context for the segmenter, and if
+# the classifier scores that one tile below threshold, the pixel is never
+# segmented at all. That second failure is invisible in the output: a roof
+# split 50/50 across a seam can score just under threshold in BOTH tiles and
+# vanish entirely, leaving no fragment and no warning. On the Altstetten test
+# area 53% of all detected panel area sat in an array flagged as possibly cut
+# short at a seam.
+#
+# At TILE_PX // 2 the window slides half a tile in BOTH axes, so every interior
+# pixel falls inside 4 tile positions -- and sits near the edge of none of them.
+# 361 positions instead of 100 on a 2573px chip, quadratic in 1/stride (halving
+# again would be ~14x, not ~7x), but only ~1.6x wall clock measured: segmentation
+# runs on flagged positions only, and fetch + model load + DSM are fixed costs.
+#
+# Default is the overlapping value because the seam fix is decisive: the area
+# flagged "possibly cut short" fell from 3614 to 61 m^2 on Altstetten and from
+# 169 to 63 m^2 on Wiedikon, while arrays that already existed changed by only
+# +2.7% / +2.4% and their tilts held. Set TILE_STRIDE_PX=256 to reproduce the
+# old partition behaviour exactly -- combine_views() is built so that it does.
+TILE_STRIDE_PX = int(os.environ.get("TILE_STRIDE_PX", TILE_PX // 2))
+
 DETECTION_WEIGHTS = "data/raw/deepsolar_weights/detection_pytorch_model.bin"
 SEGMENTATION_WEIGHTS = "data/raw/deepsolar_weights/segformer_full.pt"
 
@@ -333,9 +358,14 @@ def fetch_swissimage_chip(bbox):
 
 
 def tile_chip(image, transform, crs, center_lonlat=None):
-    """Slice a (3, H, W) array into TILE_PX x TILE_PX tiles with per-tile geo bounds.
+    """Slide a TILE_PX x TILE_PX window over a (3, H, W) array, TILE_STRIDE_PX
+    at a time in both axes, returning each position with its geo bounds.
 
-    If center_lonlat is given, the tile grid is offset so one tile is
+    At TILE_STRIDE_PX == TILE_PX the positions tile the image exactly. Below
+    that they overlap, and a pixel appears in several of them -- see
+    TILE_STRIDE_PX and combine_views().
+
+    If center_lonlat is given, the grid is offset so one tile is
     centered as closely as possible on that point (rather than starting
     blindly from the top-left corner, which could split a target roof
     across a tile boundary).
@@ -351,8 +381,12 @@ def tile_chip(image, transform, crs, center_lonlat=None):
         x_offset = int(target_col) % TILE_PX - TILE_PX // 2
 
     tiles = []
-    for y0 in range(max(0, y_offset), h - TILE_PX, TILE_PX):
-        for x0 in range(max(0, x_offset), w - TILE_PX, TILE_PX):
+    # +1 on the stop: range() is exclusive, so without it the last window that
+    # still fits entirely inside the image is never generated -- at a dimension
+    # that is an exact multiple of TILE_PX that silently drops a whole row and
+    # column of the chip from every stage of the pipeline.
+    for y0 in range(max(0, y_offset), h - TILE_PX + 1, TILE_STRIDE_PX):
+        for x0 in range(max(0, x_offset), w - TILE_PX + 1, TILE_STRIDE_PX):
             tile = image[:, y0 : y0 + TILE_PX, x0 : x0 + TILE_PX]
             utm_x, utm_y = rasterio.transform.xy(transform, y0 + TILE_PX // 2, x0 + TILE_PX // 2)
             lon, lat = rasterio.warp.transform(crs, "EPSG:4326", [utm_x], [utm_y])
@@ -387,6 +421,23 @@ def save_tile_grid(tiles, results, target_lonlat, output_path, target_label="tar
     import matplotlib.pyplot as plt
 
     p_pv_by_pos = {(r["y0"], r["x0"]): r["p_pv"] for r in results}
+
+    # At overlapping stride there are ~3.6x as many positions, and a grid of
+    # every one would be a 19x19 sheet of near-duplicate crops. Plot only the
+    # non-overlapping lattice -- the same tiles the partition would have
+    # produced -- so this figure stays readable and stays comparable between
+    # stride settings. The overlapping positions are still classified and
+    # segmented; they are just not all drawn here.
+    n_all = len(tiles)
+    y_origin = min(t["y0"] for t in tiles)
+    x_origin = min(t["x0"] for t in tiles)
+    tiles = [
+        t for t in tiles
+        if (t["y0"] - y_origin) % TILE_PX == 0 and (t["x0"] - x_origin) % TILE_PX == 0
+    ]
+    if len(tiles) < n_all:
+        print(f"  (grid shows the {len(tiles)} non-overlapping positions of {n_all})")
+
     ys = sorted(set(t["y0"] for t in tiles))
     xs = sorted(set(t["x0"] for t in tiles))
 
@@ -424,9 +475,11 @@ def combine_tile_confidence(pixel_confidences):
     """Collapse a stitched blob's per-pixel classifier confidences into one
     number for the whole array.
 
-    A blob that spans several tiles inherits a different p_pv from each tile
-    it touches. `pixel_confidences` is a 1-D array with one entry per blob
-    pixel: the p_pv of whichever tile that pixel was segmented in.
+    A blob that spans several tile positions inherits a different p_pv from
+    each. `pixel_confidences` is a 1-D array with one entry per blob pixel:
+    the mean p_pv of the tile positions that segmented that pixel (with
+    non-overlapping stride there is exactly one, so this is just "the tile it
+    came from", as before).
 
     Area-weighted mean, which is what taking the mean over PIXELS already
     gives us for free -- a blob with 3000 pixels in a confident tile and 200
@@ -491,6 +544,81 @@ def bridge_mask_gaps(canvas, radius_px):
     return shrunk[pad:-pad, pad:-pad]
 
 
+def combine_views(votes, views):
+    """Decide, per pixel, whether the overlapping segmentation views call it panel.
+
+    With TILE_STRIDE_PX < TILE_PX a pixel is segmented up to 4 times, once per
+    overlapping tile position, and those views can disagree. `votes` counts how
+    many called it panel; `views` counts how many looked at it.
+
+    Majority vote. The alternatives and why not:
+
+    - UNION (panel if any view says so) can only ever GROW the area, and every
+      view's hallucinations compound. Given this classifier's known false
+      positives -- the highest-confidence Wiedikon detection is four dormer
+      skylights -- a rule that cannot subtract is the wrong rule.
+    - AVERAGED PROBABILITY would be cleanest statistically, but segment_tile()
+      returns a hard argmax, and switching to soft output introduces a new
+      threshold with no ground truth anywhere in Zurich to set it against.
+      Majority vote adds no tunable parameter at all.
+
+    The denominator is views that ACTUALLY RAN the segmenter, not every view
+    that geometrically covers the pixel. An unflagged tile is the classifier's
+    judgement about a whole 60 m square; counting it as a "not panel" vote for
+    each of its 65k pixels over-reads a tile-level score, and would make the
+    result depend on the classification threshold twice over.
+
+    Ties go to panel (2 of 4 counts as panel): for an aggregate MW total,
+    missed capacity is the bias that actually matters, so where the views are
+    evenly split, err toward including it.
+
+    At TILE_STRIDE_PX == TILE_PX every segmented pixel has views == 1, so this
+    reduces to votes >= 1 -- exactly the boolean OR canvas it replaces. The
+    change is a generalisation of the old behaviour, not a substitute for it,
+    and running at stride 256 should reproduce the previous run exactly.
+    """
+    return (views > 0) & (votes * 2 >= views)
+
+
+def report_view_agreement(votes, views, canvas):
+    """How often do overlapping views of the same pixel agree?
+
+    This is the real prize in overlapping inference, and it is free once the
+    tiles overlap. Until now every mask this pipeline produced was a single
+    unrepeatable measurement -- there was no way to ask how stable the
+    segmenter is, only whether its output looked right. Four views per pixel
+    turns that into a number.
+
+    Read it as: if agreement is high, the masks are reproducible and the known
+    under-coverage of large arrays is a genuine model limitation. If agreement
+    is low, the segmenter is substantially noisy and every area figure in this
+    branch carries an error bar nobody has ever quoted.
+    """
+    px_m2 = TARGET_MPP**2
+    n_seg = int((views > 0).sum())
+    n_over = int((views >= 2).sum())
+    if n_over == 0:
+        print("  every pixel was segmented by at most one view -- no agreement to measure "
+              "(set TILE_STRIDE_PX < TILE_PX)")
+        return
+
+    print(f"  {n_over / n_seg:.0%} of segmented pixels were seen by 2+ views "
+          f"(mean {views[views > 0].mean():.2f} views/px)")
+
+    claimed = (views >= 2) & (votes >= 1)  # at least one overlapping view said panel
+    n = int(claimed.sum())
+    unanimous = int((claimed & (votes == views)).sum())
+    kept = int((claimed & canvas).sum())
+    print(f"  of {n} contested px ({n * px_m2:.0f} m^2) called panel by >=1 of 2+ views:")
+    print(f"    {unanimous / n:.1%} unanimous, {kept / n:.1%} survived the majority vote, "
+          f"{(n - kept) / n:.1%} outvoted and dropped")
+
+    union_m2 = int((votes >= 1).sum()) * px_m2
+    major_m2 = int(canvas.sum()) * px_m2
+    print(f"  estimator choice is worth {union_m2 - major_m2:.0f} m^2 here: "
+          f"union would give {union_m2:.0f} m^2, majority vote gives {major_m2:.0f} m^2")
+
+
 def find_pv_arrays(image, tiles, results, transform, crs, threshold=0.2):
     """Segment every tile the classifier flagged, stitch the tile-local masks
     back into ONE full-image canvas, and return one record per spatially-
@@ -521,30 +649,43 @@ def find_pv_arrays(image, tiles, results, transform, crs, threshold=0.2):
     flagged = [r for r in results if r["p_pv"] >= threshold]
 
     _, img_h, img_w = image.shape
-    canvas = np.zeros((img_h, img_w), dtype=bool)
-    # which pixels the segmenter actually looked at -- a blob that runs up
-    # against an unsegmented tile may have been cut short at that seam
-    segmented = np.zeros((img_h, img_w), dtype=bool)
-    # which flagged tile each pixel came from, so a blob can be traced back
-    # to the tiles (and the confidences) that produced it
-    tile_index = np.full((img_h, img_w), -1, dtype=np.int32)
+    # Three accumulators instead of one boolean canvas, because with
+    # overlapping tile positions a pixel is segmented up to 4 times and those
+    # views can disagree:
+    #   votes    -- how many segmented views called this pixel panel
+    #   views    -- how many segmented views looked at it at all
+    #   conf_sum -- sum of those views' tile-level p_pv, for a per-pixel mean
+    # At TILE_STRIDE_PX == TILE_PX views is 1 everywhere segmented and all
+    # three collapse back to the single-view behaviour they replace.
+    votes = np.zeros((img_h, img_w), dtype=np.int16)
+    views = np.zeros((img_h, img_w), dtype=np.int16)
+    conf_sum = np.zeros((img_h, img_w), dtype=np.float32)
 
     n_empty = 0
-    for i, r in enumerate(flagged):
+    for r in flagged:
         tile = tiles_by_pos[(r["y0"], r["x0"])]
         mask = segment_tile(tile["pixels"], seg_model, seg_processor)
         ys = slice(tile["y0"], tile["y0"] + TILE_PX)
         xs = slice(tile["x0"], tile["x0"] + TILE_PX)
-        canvas[ys, xs] |= mask
-        segmented[ys, xs] = True
-        tile_index[ys, xs] = i
+        votes[ys, xs] += mask
+        views[ys, xs] += 1
+        conf_sum[ys, xs] += r["p_pv"]
         if not mask.any():
             n_empty += 1
     print(
-        f"Segmented {len(flagged)} flagged tiles "
+        f"Segmented {len(flagged)} flagged tile positions "
         f"({n_empty} produced no PV pixels at all -- classifier likely wrong there)"
     )
     tile_conf = np.array([r["p_pv"] for r in flagged], dtype=float)
+
+    canvas = combine_views(votes, views)
+    # which pixels the segmenter actually looked at -- a blob that runs up
+    # against territory no view covered may have been cut short there
+    segmented = views > 0
+    report_view_agreement(votes, views, canvas)
+    # mean p_pv of the views that segmented each pixel; the max() only avoids
+    # a divide-by-zero on pixels nothing looked at, which canvas excludes anyway
+    pixel_conf = conf_sum / np.maximum(views, 1)
 
     # ONE connected-component pass over the whole canvas. Panel pixels either
     # side of a seam are literally adjacent here, so they join into one blob
@@ -590,17 +731,26 @@ def find_pv_arrays(image, tiles, results, transform, crs, threshold=0.2):
         utm_x, utm_y = rasterio.transform.xy(transform, y0 + rows.mean(), x0 + cols.mean())
         centroid_lon, centroid_lat = rasterio.warp.transform(crs, "EPSG:4326", [utm_x], [utm_y])
 
-        pixel_tiles = tile_index[box][sub]
-        contributing = np.unique(pixel_tiles)
+        # Which flagged tile positions actually overlap this blob's panel
+        # pixels. Computed by rectangle intersection rather than read off a
+        # per-pixel index, because with overlapping stride a pixel belongs to
+        # several tile positions at once and no single index can hold that.
+        contributing = []
+        for j, t in enumerate(flagged):
+            iy0, iy1 = max(y0, t["y0"]), min(y0 + sub.shape[0], t["y0"] + TILE_PX)
+            ix0, ix1 = max(x0, t["x0"]), min(x0 + sub.shape[1], t["x0"] + TILE_PX)
+            if iy0 < iy1 and ix0 < ix1 and sub[iy0 - y0 : iy1 - y0, ix0 - x0 : ix1 - x0].any():
+                contributing.append(j)
         n_pieces += len(contributing)
 
-        # a real array cut short at a seam, rather than a complete one --
-        # overlapping inference (stride < TILE_PX) is what would fix that
+        # a real array cut short, rather than a complete one: its panel pixels
+        # run up against ground no tile position ever segmented. Overlapping
+        # stride shrinks this to the true image border in most cases.
         truncated = bool((sub & boundary_of_segmented[box]).any())
 
         arrays.append(
             {
-                "p_pv": combine_tile_confidence(tile_conf[pixel_tiles]),
+                "p_pv": combine_tile_confidence(pixel_conf[box][sub]),
                 "tile_p_pv": tile_conf[contributing],
                 "n_tiles": len(contributing),
                 "n_mask_pieces": n_separate_pieces,
@@ -618,10 +768,14 @@ def find_pv_arrays(image, tiles, results, transform, crs, threshold=0.2):
 
     arrays.sort(key=lambda a: -a["pv_area_m2"])
     n_multi = sum(1 for a in arrays if a["n_tiles"] > 1)
+    # NOTE at overlapping stride "spans more than one tile position" is nearly
+    # universal and stops being interesting -- an array wholly inside one tile
+    # is still seen by 4 of them. The statistic that matters there is the
+    # view-agreement report above, not this count.
     n_trunc = sum(1 for a in arrays if a["possibly_truncated"])
     print(f"Stitched into {len(arrays)} arrays ({n_dropped} blobs dropped as smaller than ~1 module)")
-    print(f"  assembled from {n_pieces} tile-level pieces; {n_multi} arrays span more than one tile")
-    print(f"  {n_trunc} run up against a tile that was never segmented -- possibly cut short at a seam")
+    print(f"  assembled from {n_pieces} tile-position pieces; {n_multi} arrays span more than one position")
+    print(f"  {n_trunc} run up against ground no tile position segmented -- possibly cut short")
     print(f"  {n_bridged} were assembled across gaps of up to {GAP_BRIDGE_PX * TARGET_MPP:.1f} m "
           f"in the segmentation (would have been separate detections without gap bridging)")
     total_area = sum(a["pv_area_m2"] for a in arrays)
@@ -1657,7 +1811,11 @@ def main():
     print(f"Fetched + resampled chip: {image.shape}, crs={crs}")
 
     tiles = tile_chip(image, transform, crs, center_lonlat=target_lonlat)
-    print(f"Tiled into {len(tiles)} tiles of {TILE_PX}x{TILE_PX}px")
+    overlap_note = (
+        "" if TILE_STRIDE_PX >= TILE_PX
+        else f", sliding {TILE_STRIDE_PX}px -- overlapping, ~{(TILE_PX / TILE_STRIDE_PX) ** 2:.1f}x the inference"
+    )
+    print(f"Tiled into {len(tiles)} positions of {TILE_PX}x{TILE_PX}px{overlap_note}")
 
     print("Loading detection model...")
     model = load_detection_model()
@@ -1694,9 +1852,9 @@ def main():
         for a in arrays:
             notes = []
             if a["n_tiles"] > 1:
-                notes.append(f"stitched from {a['n_tiles']} tiles")
+                notes.append(f"seen by {a['n_tiles']} tile positions")
             if a["possibly_truncated"]:
-                notes.append("may be cut short at a seam")
+                notes.append("may be cut short")
             if a["at_grade"]:
                 notes.append(f"AT GRADE {a['height_above_ground_m']:+.1f} m -- not a roof")
             if a["implausible_tilt"]:
