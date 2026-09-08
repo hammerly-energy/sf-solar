@@ -220,9 +220,9 @@ against the cached detections (`data/level3_cv_*_detections.npz`) before being w
   **Effect, Wiedikon:** 14 records → 24 arrays from 26 pieces; the 1462 m² industrial array is one
   detection instead of three. The count went *up* because the old code also lumped several separate
   buildings in one tile into a single record — see the next bullet.
-  Each record now also carries `n_tiles` and `possibly_truncated` (blob edge runs into a tile that
-  was never segmented — the case stitching cannot fix; needs overlapping inference at stride <
-  `TILE_PX`. Currently 4 arrays in each test area).
+  Each record now also carries `n_tiles` and `possibly_truncated` (blob edge runs into ground no
+  tile position segmented — the case stitching cannot fix; **fixed separately by overlapping
+  inference, below**).
 - **Gap bridging — one roof is one array. FIXED 2026-09-07** (commit `655e49e`). Stitching removed
   the *tile* as an artificial divider but left pixel adjacency as the definition of "one array",
   which is too strict: the segmenter drops out across walkways, shadow and its own uncertainty, and
@@ -244,6 +244,51 @@ against the cached detections (`data/level3_cv_*_detections.npz`) before being w
   2 m ground gate: look for the flat region before arguing about the value.
   **Effect:** Wiedikon 24 → 16 detections (6 assembled across gaps), Altstetten 14 → 7 (4 across
   gaps). The three pieces on the Wiedikon roof are now one 1968 m² array.
+- **Overlapping inference — the tile stops being a partition. DONE 2026-09-08** (commit `dc2f798`).
+  Stitching and gap bridging both operated on masks that *existed*. The remaining seam damage was
+  masks that were never produced: the classifier gates segmentation per tile, so a roof split evenly
+  across a seam can score just under 0.2 in **both** tiles and vanish entirely — no fragment, no
+  warning. That is a false negative, and CLAUDE.md's own cross-examination notes missed capacity is
+  the one-sided bias an aggregate MW total cannot afford. `tile_chip()` now slides the window
+  `TILE_STRIDE_PX` (default `TILE_PX // 2`) in **both** axes, so every interior pixel falls inside 4
+  positions and sits ≥64 px from the edge of its best one (was 0 px).
+  **Cost is ~1.6× wall clock, not the ~3.6× the position count suggests** (Wiedikon 3:09 → 4:54) —
+  segmentation runs only on flagged positions, and fetch + model load + DSM are fixed costs.
+  **Combining the views.** The boolean OR canvas became three accumulators (`votes` / `views` /
+  `conf_sum`) and `combine_views()` takes a **majority vote among the views that actually segmented
+  each pixel**. An unflagged tile does not vote — it is the classifier's judgement about a whole 60 m
+  square, and counting it as "not panel" for each of its 65k pixels would over-read a tile-level
+  score and make the result depend on the 0.2 threshold twice. Ties go to panel. Union was rejected
+  (can only ever *grow* area, and this classifier's false positives are real); averaged probability
+  would need a new threshold with no ground truth anywhere in Zurich to set it against.
+  **The degenerate case is the regression test.** At stride == `TILE_PX` every segmented pixel has
+  `views == 1`, so `combine_views()` reduces exactly to `votes >= 1` — the OR canvas it replaces.
+  Unit-tested, and confirmed end to end: `TILE_STRIDE_PX=256` reproduces the previous run to the
+  decimal on both areas. **The old behaviour is an env var away, not a git revert.**
+  **Effect — the seam fix is decisive.** Area flagged possibly-cut-short: Altstetten **3614 → 61 m²**,
+  Wiedikon 169 → 63 m². One Wiedikon roof grew **+85%** (85 → 157 m²). Arrays that already existed
+  grew only **+2.7% / +2.4%** and held their tilts, so nothing established moved. Altstetten's
+  2198 m² blob correctly **split** into 1184 + 1026 — the pieces are 8.5 m apart, 3× the gap-bridge
+  radius, joined at stride 256 only by a thin connector the overlapping views outvoted.
+  **Repeatability, measured for the first time.** `report_view_agreement()` runs every pass. Four
+  views per pixel turn every mask from a single unrepeatable measurement into one with an error bar:
+  **84.3% of contested Wiedikon pixels and 93.6% of Altstetten's are unanimous**, 2.4–6.2% get
+  outvoted. Union vs majority is worth only **170–208 m² (2–6%)**, so the estimator choice mattered
+  far less than expected. **Read this as repeatability, NOT correctness** — five views agreeing on a
+  skylight is five views consistently wrong, and the false-positive rate remains unmeasured.
+  **The 20% area rise is the honest caveat.** Wiedikon total went 3022 → 3627 m², and **86% of that
+  (522 m²) is entirely new detections**, not recovered ones — 13 of them, median 28 m², median tilt
+  29.8°, in an area whose confirmed arrays are 0–13°. Their tilts prove nothing either way (the
+  documented leverage bias makes *any* small footprint's tilt unreliable), and the size-tilt
+  correlation strengthening to ρ = −0.453 (p=0.014) is mechanically expected from adding small
+  detections, not independent evidence. 5 of 13 were seen by only one flagged view, so voting could
+  not contest them; the ground/tilt gates caught 4. **This is best read as denser sampling of a
+  detector whose false-positive rate was always unmeasured, not as a new defect introduced here** —
+  under-sampling to keep it hidden would be the wrong fix. Measuring that rate against
+  `ch.bfe.elektrizitaetsproduktionsanlagen` is the outstanding job.
+  Also fixed here: `tile_chip()`'s exclusive `range()` stop, which dropped the last full row and
+  column at any dimension that is an exact multiple of `TILE_PX` (a 4×4 grid became 3×3). No effect
+  at the Zurich chip size, which is what makes the stride-256 regression test valid.
 - **~~`pv_area_m2` and `tilt_deg` describe different objects.~~ FIXED by the same change.** Area
   used to sum the whole tile mask across every building in it while tilt came from `planes[0]`, the
   largest connected facet of that pile. Each record is now one contiguous blob, so both describe the
@@ -257,9 +302,8 @@ against the cached detections (`data/level3_cv_*_detections.npz`) before being w
   exhausting `MAX_OUTLIER_ITERATIONS`: the last pass assigns `valid = tightened` and the loop ends with
   no refit, so the returned `(a,b,c)` was fit to the previous, larger point set. `fit_group_planes()`
   then peels leftovers against that stale pairing.
-- `tile_chip()` uses `range(0, h - TILE_PX, TILE_PX)` — exclusive, so the last full tile row and column
-  are never generated. At any dimension that is an exact multiple of 256, a whole row and column of the
-  chip goes unclassified.
+- ~~`tile_chip()` uses `range(0, h - TILE_PX, TILE_PX)` — exclusive, so the last full tile row and
+  column are never generated.~~ **FIXED 2026-09-08** (commit `dc2f798`), alongside the stride change.
 - ~~`fetch_swissimage_chip()` uses `Resampling.bilinear` for a **2.36× decimation** with no
   anti-alias prefilter~~ — **TESTED 2026-09-06, NOT THE CAUSE. Do not re-try this.** The mechanism
   was plausible (panel rows, skylight glazing grids and painted parking-bay lines are all periodic
