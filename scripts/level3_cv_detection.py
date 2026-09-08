@@ -544,6 +544,161 @@ def bridge_mask_gaps(canvas, radius_px):
     return shrunk[pad:-pad, pad:-pad]
 
 
+# A standard crystalline PV module is about 1.7 x 1.0 m. Snapping a footprint
+# to the SHORT edge lets the grid represent modules laid either way round at
+# ~1 m granularity; snapping to 1.7 m would be coarser and would shave real
+# edges. See sweep_regularization_cell() -- this is checked against a plateau,
+# not asserted.
+MODULE_SHORT_EDGE_M = 1.0
+
+# Blur applied before measuring edge direction. See dominant_orientation_deg().
+ORIENTATION_SMOOTH_PX = 2.0
+
+
+def dominant_orientation_deg(mask):
+    """The angle, 0-90 deg, of the mask boundary's most common edge direction.
+
+    A solar array is rectilinear: panels are rectangles in rows on rectangular
+    racks, so its outline is dominated by two edge directions 90 deg apart.
+    Folding the histogram mod 90 collapses those two into one peak.
+
+    Voting over every boundary pixel, weighted by gradient magnitude, rather
+    than taking the minimum-area bounding rectangle: the bounding rectangle is
+    decided by whichever few pixels stick out furthest, so one stray blob of
+    segmentation noise rotates the whole answer. A vote is decided by the bulk
+    of the outline and barely notices the same blob.
+
+    The returned angle is in ndimage.rotate()'s sense: rotating the mask by
+    -theta brings its dominant edges onto the axes.
+
+    Returns 0.0 for a mask with no usable boundary (empty, or a single pixel).
+    """
+    from scipy import ndimage
+
+    # MUST smooth before differencing. np.gradient on a BINARY mask uses a
+    # two-pixel stencil on 0/1 data, so the only directions it can produce are
+    # 0 and 45 deg -- no rotated rectangle is recoverable, and the function
+    # returns a plausible-looking wrong answer rather than failing. Blurring
+    # first makes the boundary a ramp and the directions continuous.
+    # sigma is a compromise: 1.0 leaves ~7 deg of error, 3.0 is slightly more
+    # accurate but smears a small footprint (a 10 m^2 detection is barely 13 px
+    # across). Small footprints have unreliable orientation either way.
+    smoothed = ndimage.gaussian_filter(mask.astype(float), sigma=ORIENTATION_SMOOTH_PX)
+    gy, gx = np.gradient(smoothed)
+    magnitude = np.hypot(gx, gy)
+    if magnitude.max() <= 0:
+        return 0.0
+    # arctan2 gives the direction of steepest ascent, perpendicular to the
+    # edge -- but perpendicular is +90 deg, which mod 90 is the same bin, so
+    # no correction is needed for that. The NEGATION is needed: array rows
+    # increase downwards, so this frame is left-handed relative to the one
+    # ndimage.rotate() uses, and an un-negated angle would make
+    # regularize_footprint() rotate the wrong way and double the misalignment.
+    angle = -np.degrees(np.arctan2(gy, gx)) % 90.0
+    hist = np.zeros(90)
+    np.add.at(hist, angle.astype(int) % 90, magnitude)
+    # 'wrap' because 89 deg and 0 deg are adjacent directions, not opposite ends
+    hist = ndimage.gaussian_filter1d(hist, sigma=1.5, mode="wrap")
+    return float(np.argmax(hist))
+
+
+def _pad_square(mask):
+    """Centre a mask in a square big enough that rotation cannot clip a corner."""
+    h, w = mask.shape
+    side = int(np.ceil(np.hypot(h, w))) + 2
+    pad_y, pad_x = (side - h) // 2, (side - w) // 2
+    out = np.zeros((side, side), dtype=bool)
+    out[pad_y : pad_y + h, pad_x : pad_x + w] = mask
+    return out, (pad_y, pad_x, h, w)
+
+
+def regularize_footprint(mask, mpp=TARGET_MPP, cell_m=MODULE_SHORT_EDGE_M):
+    """Snap a blobby segmentation mask to a rectilinear footprint aligned with
+    the array's own dominant orientation and quantised to the module grid.
+
+    Three steps, each boring on its own:
+      1. find the dominant edge direction and rotate the mask onto the axes
+      2. lay a cell_m grid over it and keep every cell at least half covered
+      3. rotate back
+
+    Step 2 is what makes the result rectilinear: a union of grid cells has
+    right angles by construction, so there is no contour simplification and no
+    vertex-angle snapping to tune. "At least half covered" is the same
+    inclusive-on-ties rule as combine_views(), for the same reason -- for an
+    aggregate capacity total, dropping real panel area is the worse error.
+
+    IMPORTANT -- this is not automatically an improvement, and is deliberately
+    NOT wired into the pipeline. Every pixel it adds beyond the true panel edge
+    is a pixel fit_roof_plane() will then fit a roof plane through. The
+    documented leverage bias means a handful of contaminating roof-edge DSM
+    pixels swings a small footprint's tilt by degrees, so a "tidier" footprint
+    can buy a worse geometry. Validate against measured tilt before adopting.
+
+    Returns (regularized_mask, theta_deg).
+    """
+    from scipy import ndimage
+
+    if not mask.any():
+        return mask.copy(), 0.0
+
+    theta = dominant_orientation_deg(mask)
+    square, (pad_y, pad_x, h, w) = _pad_square(mask)
+
+    # order=0 keeps the array boolean; reshape=False keeps the round trip's
+    # shapes identical so the result can be cropped straight back
+    rotated = ndimage.rotate(square.astype(np.uint8), -theta, reshape=False, order=0) > 0
+
+    cell = max(1, int(round(cell_m / mpp)))
+    coarse = np.zeros_like(rotated)
+    ys, xs = np.nonzero(rotated)
+    if len(ys):
+        # Anchor the grid on the mask's own top-left corner, NOT on the canvas
+        # origin. Otherwise the array's edges fall at an arbitrary offset into
+        # a cell, every edge cell is part-covered, and the >= 0.5 rule inflates
+        # a clean rectangle by ~13% -- growth that would go straight into
+        # fit_roof_plane(). Anchoring also makes the result translation-
+        # invariant: the same array shifted two pixels regularizes the same.
+        r0, c0 = int(ys.min()), int(xs.min())
+        sub = rotated[r0 : int(ys.max()) + 1, c0 : int(xs.max()) + 1]
+        nh = int(np.ceil(sub.shape[0] / cell))
+        nw = int(np.ceil(sub.shape[1] / cell))
+        # Anchored at the mask's corner, NOT centred on it. Centring was tried
+        # (to avoid the grid always padding towards the bottom-right) and is
+        # worse: it makes the grid origin depend on the mask's SIZE as well as
+        # its corner, so a one-pixel change in the bounding box repartitions
+        # every cell. Measured, centring took re-application IoU from 0.93 to
+        # 0.87 and area stability from 0.1% to 10%. Corner anchoring costs a
+        # ~1.4 px displacement on re-application, which is real but bounded;
+        # centring costs stability, which is not.
+        region = np.zeros((nh * cell, nw * cell), dtype=bool)
+        region[: sub.shape[0], : sub.shape[1]] = sub
+        keep = region.reshape(nh, cell, nw, cell).mean(axis=(1, 3)) >= 0.5
+        grid = np.repeat(np.repeat(keep, cell, axis=0), cell, axis=1)
+        hh = min(grid.shape[0], coarse.shape[0] - r0)
+        ww = min(grid.shape[1], coarse.shape[1] - c0)
+        coarse[r0 : r0 + hh, c0 : c0 + ww] = grid[:hh, :ww]
+
+    back = ndimage.rotate(coarse.astype(np.uint8), theta, reshape=False, order=0) > 0
+    return back[pad_y : pad_y + h, pad_x : pad_x + w], theta
+
+
+def footprint_change(original, regularized, mpp=TARGET_MPP):
+    """What regularization did, in the terms that matter downstream.
+
+    `added_m2` is the number to watch: those are pixels no view called panel,
+    which fit_roof_plane() would nonetheless fit a plane through.
+    """
+    inter = int((original & regularized).sum())
+    union = int((original | regularized).sum())
+    return {
+        "iou": inter / union if union else 1.0,
+        "added_m2": int((regularized & ~original).sum()) * mpp**2,
+        "removed_m2": int((original & ~regularized).sum()) * mpp**2,
+        "area_before_m2": int(original.sum()) * mpp**2,
+        "area_after_m2": int(regularized.sum()) * mpp**2,
+    }
+
+
 def combine_views(votes, views):
     """Decide, per pixel, whether the overlapping segmentation views call it panel.
 
