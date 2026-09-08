@@ -20,14 +20,35 @@ on the page.
 """
 
 import base64
+import datetime
 import io
 import json
 import os
+import subprocess
 
 import numpy as np
 from PIL import Image
 
 OUT = "data/pipeline_artifact.html"
+HISTORY = "data/pipeline_versions.json"
+
+# Quantities the page actually asserts. A version is cut when one of these
+# moves -- not when a file changes. Editing a comment in the pipeline does not
+# make the page a new version; re-running it and getting 30 arrays instead of
+# 29 does. Rounded so float noise cannot manufacture a version.
+TRACKED = [
+    ("windows",      "windows classified",         lambda d: d["positions"]),
+    ("segmented",    "windows segmented",          lambda d: d["flagged"]),
+    ("arrays",       "arrays detected",            lambda d: d["n"]),
+    ("total_m2",     "total panel area (m2)",      lambda d: round(d["total"])),
+    ("kept_arrays",  "arrays kept by the gates",   lambda d: d["kept_n"]),
+    ("kept_m2",      "panel area kept (m2)",       lambda d: round(d["kept_area"])),
+    ("rho",          "rho(area, tilt)",            lambda d: _rho(d)),
+    ("tilt_small",   "median tilt <120 m2 (deg)",  lambda d: _med_tilt(d, True)),
+    ("tilt_large",   "median tilt >=120 m2 (deg)", lambda d: _med_tilt(d, False)),
+    ("tilt_max",     "steepest fitted tilt (deg)", lambda d: round(max(a["tilt"] for a in d["arrays"]), 1)),
+    ("lowest_kept",  "lowest kept detection (m)",  lambda d: _lowest_kept(d)),
+]
 
 # meta row layout written by save_detection_cache()
 F = dict(p=0, y0=1, x0=2, area=3, lat=4, lon=5, tilt=6, az=7,
@@ -95,6 +116,104 @@ def collect(mode):
         kept_n=sum(1 for a in arrays if not a["gated"]),
         kept_area=round(float(sum(a["area"] for a in arrays if not a["gated"])), 1),
     )
+
+
+def _ranks(v):
+    """Average ranks, ties shared -- the rank transform Spearman needs."""
+    order = np.argsort(v, kind="mergesort")
+    r = np.empty(len(v), float)
+    r[order] = np.arange(len(v), dtype=float)
+    for val in np.unique(v):
+        m = v == val
+        if m.sum() > 1:
+            r[m] = r[m].mean()
+    return r
+
+
+def _rho(d):
+    """Spearman(area, tilt). Computed here rather than imported so the build
+    stays on numpy + pillow -- the same two libraries the pre-commit hook
+    installs."""
+    a = np.array([x["area"] for x in d["arrays"]], float)
+    t = np.array([x["tilt"] for x in d["arrays"]], float)
+    if len(a) < 3:
+        return None
+    ra, rt = _ranks(a), _ranks(t)
+    ra, rt = ra - ra.mean(), rt - rt.mean()
+    denom = np.sqrt((ra**2).sum() * (rt**2).sum())
+    return None if denom == 0 else round(float((ra * rt).sum() / denom), 3)
+
+
+def _med_tilt(d, small):
+    t = [x["tilt"] for x in d["arrays"] if (x["area"] < 120) == small]
+    return None if not t else round(float(np.median(t)), 1)
+
+
+def _lowest_kept(d):
+    h = [x["h"] for x in d["arrays"] if not x["gated"] and x["h"] is not None]
+    return None if not h else round(min(h), 1)
+
+
+def measure(data):
+    """Flatten every tracked figure into one comparable dict."""
+    out = {}
+    for mode, d in data.items():
+        for key, _label, fn in TRACKED:
+            out[f"{mode}.{key}"] = fn(d)
+    return out
+
+
+def _git(*args, default=""):
+    try:
+        return subprocess.run(["git", *args], capture_output=True, text=True,
+                              check=True).stdout.strip()
+    except Exception:
+        return default
+
+
+def update_history(metrics):
+    """Append a version if any tracked figure moved. Returns the full history.
+
+    Run from the pre-commit hook, so HEAD is the last COMPLETED commit and the
+    commit being written does not exist yet. Rather than guess at it, each entry
+    records the commits landed since the previous entry -- which is the honest
+    answer to 'what changed the numbers' anyway, since several commits usually
+    sit between two pipeline runs.
+    """
+    history = []
+    if os.path.exists(HISTORY):
+        history = json.load(open(HISTORY))
+
+    if history and history[-1]["metrics"] == metrics:
+        return history, None                      # nothing moved; no new version
+
+    labels = {f"{m}.{k}": (m, lab) for m in ("zurich", "altstetten")
+              for k, lab, _ in TRACKED}
+    prev = history[-1]["metrics"] if history else {}
+    changes = []
+    for key, new in metrics.items():
+        old = prev.get(key, "__absent__")
+        if old != new:
+            mode, label = labels[key]
+            changes.append({"area": mode, "label": label,
+                            "from": None if old == "__absent__" else old, "to": new})
+
+    head = _git("rev-parse", "--short", "HEAD")
+    since = history[-1]["sha"] if history else None
+    rng = f"{since}..HEAD" if since else "-8"
+    commits = [l for l in _git("log", "--oneline", "--no-decorate", rng).splitlines() if l]
+
+    entry = {
+        "version": len(history) + 1,
+        "date": datetime.date.today().isoformat(),
+        "sha": head,
+        "commits": commits[:12],
+        "changes": changes,
+        "metrics": metrics,
+    }
+    history.append(entry)
+    json.dump(history, open(HISTORY, "w"), indent=1)
+    return history, entry
 
 
 HEAD = r"""<title>Orthophoto to Tilt</title>
@@ -177,6 +296,38 @@ HEAD = r"""<title>Orthophoto to Tilt</title>
   svg { display:block; max-width:100%; height:auto; }
   text { font-family:"IBM Plex Mono",monospace; }
 
+  .verbadge { display:flex; flex-wrap:wrap; align-items:baseline; gap:8px 14px;
+              margin-top:20px; font-family:var(--mono); font-size:11.5px; }
+  .verbadge .vnum { background:var(--accent); color:var(--card); padding:3px 9px;
+                    border-radius:3px; font-weight:500; letter-spacing:.03em; }
+  .verbadge .vmeta { color:var(--faint); }
+  .verbadge .vdelta { color:var(--warn); }
+
+  .vlist { border-top:2px solid var(--ink); }
+  .ver { display:grid; grid-template-columns:132px 1fr; gap:20px;
+         padding:18px 0; border-bottom:1px solid var(--rule-soft); }
+  .ver.current { background:linear-gradient(90deg,var(--accent-ghost),transparent 70%); }
+  .vhead .vn { font-family:var(--mono); font-size:15px; font-weight:500; color:var(--accent); }
+  .vhead .vd { font-family:var(--mono); font-size:11px; color:var(--faint); display:block;
+               margin-top:3px; }
+  .vhead .vsha { font-family:var(--mono); font-size:10.5px; color:var(--faint); display:block; }
+  .vchanges { list-style:none; margin:0 0 12px; padding:0; }
+  .vchanges li { display:grid; grid-template-columns:88px 1fr auto; gap:12px;
+                 align-items:baseline; padding:3px 0; font-size:13px; color:var(--muted); }
+  .vchanges .varea { font-family:var(--mono); font-size:10px; letter-spacing:.06em;
+                     text-transform:uppercase; color:var(--faint); }
+  .vchanges .vval { font-family:var(--mono); font-variant-numeric:tabular-nums;
+                    font-size:12.5px; white-space:nowrap; }
+  .vchanges .vval .old { color:var(--faint); text-decoration:line-through; }
+  .vchanges .vval .new { color:var(--ink); font-weight:500; }
+  .vchanges .vval .arr { color:var(--accent); padding:0 5px; }
+  .vcommits { margin:0; padding:10px 0 0; border-top:1px dashed var(--rule-soft);
+              list-style:none; }
+  .vcommits li { font-family:var(--mono); font-size:11px; color:var(--faint);
+                 padding:1.5px 0; }
+  .vcommits li b { color:var(--muted); font-weight:500; }
+  .vnone { font-size:13px; color:var(--faint); font-style:italic; }
+
   .chartwrap { overflow-x:auto; }
   .chartwrap svg { min-width:760px; }
   .phase-key { display:flex; flex-wrap:wrap; gap:8px 22px; font-family:var(--mono);
@@ -240,6 +391,7 @@ HEAD = r"""<title>Orthophoto to Tilt</title>
     rooftop solar array in it. Every figure and every shape on this page is drawn from the
     detection caches of the most recent run &mdash; <em>including the parts that are wrong</em>.
   </p>
+  <div class="verbadge" id="verbadge"></div>
 </header>
 
 <h2>The pipeline, end to end</h2>
@@ -393,6 +545,15 @@ HEAD = r"""<title>Orthophoto to Tilt</title>
     <dd class="verdict v-no">unmeasured</dd></div>
 </dl>
 
+<h2>Version history</h2>
+<p class="lede">
+  A version is cut when a <b>measured figure moves</b> &mdash; not when a file changes. Editing a
+  comment in the pipeline does not make this a new version; re-running it and getting 30 arrays
+  instead of 29 does. Each entry lists the commits that landed since the previous one, so a number
+  that moved can be traced back to the work that moved it.
+</p>
+<div class="vlist" id="vlist"></div>
+
 <h2>Where it goes next</h2>
 <div class="closing">
   <p>
@@ -441,6 +602,46 @@ TAIL = r"""
   const txt = (s, a, p) => { const e = el("text", a, p); e.textContent = s; return e; };
   const svg = (w, h, p) => el("svg", { viewBox: `0 0 ${w} ${h}`, width: "100%" }, p);
   const AREAS = [["zurich", "Wiedikon"], ["altstetten", "Altstetten"]];
+
+  /* ---------------- version badge + history ---------------- */
+  (function () {
+    const V = D._versions || [];
+    if (!V.length) return;
+    const cur = V[V.length - 1];
+    const esc = t => String(t).replace(/[<>&]/g, c => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]));
+
+    document.getElementById("verbadge").innerHTML =
+      `<span class="vnum">v${cur.version}</span>` +
+      `<span class="vmeta">${cur.date} &middot; built on ${esc(cur.sha)}</span>` +
+      (cur.changes.length
+        ? `<span class="vdelta">${cur.changes.length} figure${cur.changes.length > 1 ? "s" : ""} moved since v${cur.version - 1 || 1}</span>`
+        : "");
+
+    const val = c =>
+      c.from === null || c.from === undefined
+        ? `<span class="new">${esc(c.to)}</span> <span class="old">new</span>`
+        : `<span class="old">${esc(c.from)}</span><span class="arr">&rarr;</span><span class="new">${esc(c.to)}</span>`;
+
+    document.getElementById("vlist").innerHTML = V.slice().reverse().map((v, i) => `
+      <div class="ver${i === 0 ? " current" : ""}">
+        <div class="vhead">
+          <span class="vn">v${v.version}</span>
+          <span class="vd">${v.date}</span>
+          <span class="vsha">built on ${esc(v.sha)}</span>
+        </div>
+        <div>
+          ${v.changes.length ? `<ul class="vchanges">${v.changes.map(c => `
+            <li><span class="varea">${esc(c.area)}</span>
+                <span>${esc(c.label)}</span>
+                <span class="vval">${val(c)}</span></li>`).join("")}</ul>`
+            : `<p class="vnone">First recorded build &mdash; nothing to compare against.</p>`}
+          ${v.commits.length ? `<ul class="vcommits">${v.commits.map(c => {
+            const sp = c.indexOf(" ");
+            return `<li><b>${esc(c.slice(0, sp))}</b> ${esc(c.slice(sp + 1))}</li>`;
+          }).join("")}</ul>` : ""}
+        </div>
+      </div>`).join("");
+  })();
 
   /* ---------------- flowchart ---------------- */
   (function () {
@@ -770,14 +971,26 @@ TAIL = r"""
 
 def main():
     data = {mode: collect(mode) for mode in ("zurich", "altstetten")}
+    history, cut = update_history(measure(data))
+    # keep `data` as area -> figures; the version history rides alongside it in
+    # the payload rather than inside it, so the summary loop below stays simple
+    payload = dict(data, _versions=history)
     html = (HEAD
             + '<script id="pipeline-data" type="application/json">'
-            + json.dumps(data)
+            + json.dumps(payload)
             + "</script>"
             + TAIL)
     io.open(OUT, "w", encoding="utf-8").write(html)
 
     print(f"wrote {OUT}  ({len(html) / 1024:.0f} KB)")
+    if cut:
+        print(f"  cut v{cut['version']} -- {len(cut['changes'])} figure(s) moved, "
+              f"{len(cut['commits'])} commit(s) since the last version:")
+        for c in cut["changes"][:12]:
+            frm = "new" if c["from"] is None else c["from"]
+            print(f"    {c['area']:11s} {c['label']:28s} {frm} -> {c['to']}")
+    else:
+        print(f"  no tracked figure moved -- still v{history[-1]['version']}")
     for mode, d in data.items():
         print(f"  {mode:11s} {d['positions']:3d} windows -> {d['flagged']:3d} segmented "
               f"-> {d['n']:2d} arrays -> {d['kept_n']:2d} kept   "

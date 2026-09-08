@@ -17,6 +17,7 @@
 set -u
 
 ART="data/pipeline_artifact.html"
+HIST="data/pipeline_versions.json"
 URL="https://claude.ai/code/artifact/7c58f59e-4634-4af5-b481-0eeb1baf31fc"
 
 caches=$(ls data/level3_cv_*_detections.npz 2>/dev/null)
@@ -31,13 +32,21 @@ done
 [ "$stale" -eq 1 ] || exit 0      # page is current; stay quiet
 
 echo "pre-commit: a detection cache is newer than $ART -- rebuilding"
-if uv run --isolated --with numpy --with pillow \
-        python scripts/build_pipeline_artifact.py >/dev/null 2>&1; then
+out=$(uv run --isolated --with numpy --with pillow \
+        python scripts/build_pipeline_artifact.py 2>&1)
+if [ $? -eq 0 ]; then
+    # The build cuts a version whenever a tracked figure moved, and records the
+    # commits landed since the previous one. Stage it so that entry ships in
+    # THIS commit -- the one whose work produced the numbers.
+    if [ -f "$HIST" ]; then
+        git add "$HIST" 2>/dev/null || true
+    fi
+    echo "$out" | sed -n '/cut v/,/^  [a-z]* *[0-9]* windows/p' | sed '$d' | sed 's/^/  /'
     cat <<EOF
 
   +-- ARTIFACT REBUILT -------------------------------------------------+
   |  $ART now matches the current caches.
-  |  It is gitignored, so this commit does not carry it.
+  |  It is gitignored; $HIST is staged into this commit.
   |
   |  Publishing needs a Claude session -- a hook cannot do it. Ask Claude:
   |    "republish the pipeline artifact"
@@ -46,6 +55,7 @@ if uv run --isolated --with numpy --with pillow \
 
 EOF
 else
+    echo "$out" | tail -3 >&2
     echo "pre-commit: rebuild FAILED -- commit continues, artifact left stale" >&2
     echo "  run it by hand to see why:" >&2
     echo "  uv run --isolated --with numpy --with pillow python scripts/build_pipeline_artifact.py" >&2

@@ -1,0 +1,175 @@
+[
+ {
+  "version": 1,
+  "date": "2026-09-08",
+  "sha": "e8356bd",
+  "commits": [
+   "e8356bd Add a pre-commit hook that rebuilds the pipeline artifact when it goes stale",
+   "3b775f7 Generate the pipeline artifact from the caches instead of by hand",
+   "29ac674 Split roof geometry out of the CV pipeline so it can be tested cheaply",
+   "4d88bd5 Add footprint regularization with unit tests; it does not do what was wanted",
+   "fa505de Record overlapping inference in CLAUDE.md, with the area caveat",
+   "dc2f798 Slide the tile window at half-tile stride instead of tiling the image",
+   "7bfad31 Record gap bridging in CLAUDE.md, confirmed on both test areas",
+   "655e49e Bridge segmentation gaps before deciding what counts as one array"
+  ],
+  "changes": [
+   {
+    "area": "zurich",
+    "label": "windows classified",
+    "from": null,
+    "to": 361
+   },
+   {
+    "area": "zurich",
+    "label": "windows segmented",
+    "from": null,
+    "to": 71
+   },
+   {
+    "area": "zurich",
+    "label": "arrays detected",
+    "from": null,
+    "to": 29
+   },
+   {
+    "area": "zurich",
+    "label": "total panel area (m2)",
+    "from": null,
+    "to": 3627
+   },
+   {
+    "area": "zurich",
+    "label": "arrays kept by the gates",
+    "from": null,
+    "to": 23
+   },
+   {
+    "area": "zurich",
+    "label": "panel area kept (m2)",
+    "from": null,
+    "to": 3397
+   },
+   {
+    "area": "zurich",
+    "label": "rho(area, tilt)",
+    "from": null,
+    "to": -0.453
+   },
+   {
+    "area": "zurich",
+    "label": "median tilt <120 m2 (deg)",
+    "from": null,
+    "to": 27.1
+   },
+   {
+    "area": "zurich",
+    "label": "median tilt >=120 m2 (deg)",
+    "from": null,
+    "to": 3.7
+   },
+   {
+    "area": "zurich",
+    "label": "steepest fitted tilt (deg)",
+    "from": null,
+    "to": 83.8
+   },
+   {
+    "area": "zurich",
+    "label": "lowest kept detection (m)",
+    "from": null,
+    "to": 4.3
+   },
+   {
+    "area": "altstetten",
+    "label": "windows classified",
+    "from": null,
+    "to": 361
+   },
+   {
+    "area": "altstetten",
+    "label": "windows segmented",
+    "from": null,
+    "to": 46
+   },
+   {
+    "area": "altstetten",
+    "label": "arrays detected",
+    "from": null,
+    "to": 11
+   },
+   {
+    "area": "altstetten",
+    "label": "total panel area (m2)",
+    "from": null,
+    "to": 7300
+   },
+   {
+    "area": "altstetten",
+    "label": "arrays kept by the gates",
+    "from": null,
+    "to": 9
+   },
+   {
+    "area": "altstetten",
+    "label": "panel area kept (m2)",
+    "from": null,
+    "to": 7005
+   },
+   {
+    "area": "altstetten",
+    "label": "rho(area, tilt)",
+    "from": null,
+    "to": -0.382
+   },
+   {
+    "area": "altstetten",
+    "label": "median tilt <120 m2 (deg)",
+    "from": null,
+    "to": 2.6
+   },
+   {
+    "area": "altstetten",
+    "label": "median tilt >=120 m2 (deg)",
+    "from": null,
+    "to": 0.3
+   },
+   {
+    "area": "altstetten",
+    "label": "steepest fitted tilt (deg)",
+    "from": null,
+    "to": 4.0
+   },
+   {
+    "area": "altstetten",
+    "label": "lowest kept detection (m)",
+    "from": null,
+    "to": 3.3
+   }
+  ],
+  "metrics": {
+   "zurich.windows": 361,
+   "zurich.segmented": 71,
+   "zurich.arrays": 29,
+   "zurich.total_m2": 3627,
+   "zurich.kept_arrays": 23,
+   "zurich.kept_m2": 3397,
+   "zurich.rho": -0.453,
+   "zurich.tilt_small": 27.1,
+   "zurich.tilt_large": 3.7,
+   "zurich.tilt_max": 83.8,
+   "zurich.lowest_kept": 4.3,
+   "altstetten.windows": 361,
+   "altstetten.segmented": 46,
+   "altstetten.arrays": 11,
+   "altstetten.total_m2": 7300,
+   "altstetten.kept_arrays": 9,
+   "altstetten.kept_m2": 7005,
+   "altstetten.rho": -0.382,
+   "altstetten.tilt_small": 2.6,
+   "altstetten.tilt_large": 0.3,
+   "altstetten.tilt_max": 4.0,
+   "altstetten.lowest_kept": 3.3
+  }
+ }
+]

@@ -223,6 +223,20 @@ Reservoir, known-broken).)
   **Publishing stays manual, and cannot be otherwise.** Pushing to the artifact URL needs the Artifact
   tool and therefore a Claude session. The hook prints the reminder and the link; say "republish the
   pipeline artifact" and it goes out on the same URL.
+
+  **Versions are cut by measurement, not by commit.** `data/pipeline_versions.json` (committed — it is
+  the record, not a build output) accumulates one entry per build in which a *tracked figure moved*.
+  Editing a comment in the pipeline is not a new version; re-running it and getting 30 arrays instead
+  of 29 is. The 22 tracked figures are declared in `TRACKED` in the build script — detection counts,
+  panel areas, ρ(area, tilt), median tilts either side of 120 m², steepest tilt, and lowest kept
+  detection, per test area. **To track a new claim the page makes, add it to `TRACKED`**; anything not
+  in that list can change silently.
+
+  Each entry records the commits landed since the previous entry rather than a single commit. That is
+  deliberate: the build runs from a pre-commit hook, so `HEAD` is the last *completed* commit and the
+  one being written does not exist yet — and in practice several commits sit between two pipeline
+  runs anyway, so "which commits moved this number" is the honest question. The hook stages the
+  history file so the entry ships in the commit whose work produced the numbers.
 - Keep scripts runnable standalone: `uv run python scripts/whatever.py`.
 - Data files go in `data/`. Raw downloads in `data/raw/` and **gitignored** — they're large and re-downloadable.
 - If a script takes more than a few seconds, cache its output to disk so I'm not re-running it constantly.
