@@ -206,9 +206,23 @@ Reservoir, known-broken).)
   time and nothing is transcribed — if a number can't be derived from the caches, it doesn't belong
   on the page.
 
-  **Regenerating is scriptable; publishing is not.** A git hook can rebuild the HTML, but pushing it
-  to the artifact URL needs the Artifact tool and therefore a Claude session. Treat it as a checklist
-  item: change the pipeline → rerun both test areas → rebuild → republish.
+  **The rebuild half is automated.** `.githooks/pre-commit` rebuilds the HTML whenever a detection
+  cache is newer than it — i.e. whenever the pipeline has been re-run since the page was last built.
+  Enable it once per clone:
+
+  ```
+  git config core.hooksPath .githooks
+  ```
+
+  It keys off cache mtime rather than staged paths on purpose: editing `level3_cv_detection.py`
+  changes nothing on the page until the pipeline actually runs, so a staged-path trigger would fire
+  constantly and rebuild an identical file. **The hook never blocks a commit** — it exits 0 on every
+  path, including when the rebuild fails. Failing a commit over a documentation page would be worse
+  than a stale page.
+
+  **Publishing stays manual, and cannot be otherwise.** Pushing to the artifact URL needs the Artifact
+  tool and therefore a Claude session. The hook prints the reminder and the link; say "republish the
+  pipeline artifact" and it goes out on the same URL.
 - Keep scripts runnable standalone: `uv run python scripts/whatever.py`.
 - Data files go in `data/`. Raw downloads in `data/raw/` and **gitignored** — they're large and re-downloadable.
 - If a script takes more than a few seconds, cache its output to disk so I'm not re-running it constantly.

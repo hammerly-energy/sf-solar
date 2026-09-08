@@ -1,0 +1,54 @@
+#!/bin/sh
+# Rebuild data/pipeline_artifact.html when a detection cache is newer than it.
+#
+# WHY THE TRIGGER IS CACHE MTIME AND NOT THE STAGED FILES. The page's numbers
+# come from data/level3_cv_*_detections.npz, not from the source. Editing
+# level3_cv_detection.py changes nothing on the page until the pipeline is
+# actually re-run, so keying off staged paths would fire constantly and rebuild
+# an identical file. A cache newer than the artifact is the real signal: it
+# means the pipeline ran since the page was last built.
+#
+# THIS HOOK NEVER BLOCKS A COMMIT. The artifact is a documentation page;
+# failing a commit over it would be worse than letting it go stale. Every path
+# through here exits 0.
+#
+# Enable once per clone:   git config core.hooksPath .githooks
+
+set -u
+
+ART="data/pipeline_artifact.html"
+URL="https://claude.ai/code/artifact/7c58f59e-4634-4af5-b481-0eeb1baf31fc"
+
+caches=$(ls data/level3_cv_*_detections.npz 2>/dev/null)
+[ -n "$caches" ] || exit 0        # nothing to build from; stay quiet
+
+stale=0
+for c in $caches; do
+    if [ ! -f "$ART" ] || [ "$c" -nt "$ART" ]; then
+        stale=1
+    fi
+done
+[ "$stale" -eq 1 ] || exit 0      # page is current; stay quiet
+
+echo "pre-commit: a detection cache is newer than $ART -- rebuilding"
+if uv run --isolated --with numpy --with pillow \
+        python scripts/build_pipeline_artifact.py >/dev/null 2>&1; then
+    cat <<EOF
+
+  +-- ARTIFACT REBUILT -------------------------------------------------+
+  |  $ART now matches the current caches.
+  |  It is gitignored, so this commit does not carry it.
+  |
+  |  Publishing needs a Claude session -- a hook cannot do it. Ask Claude:
+  |    "republish the pipeline artifact"
+  |  It keeps the same link: $URL
+  +---------------------------------------------------------------------+
+
+EOF
+else
+    echo "pre-commit: rebuild FAILED -- commit continues, artifact left stale" >&2
+    echo "  run it by hand to see why:" >&2
+    echo "  uv run --isolated --with numpy --with pillow python scripts/build_pipeline_artifact.py" >&2
+fi
+
+exit 0
