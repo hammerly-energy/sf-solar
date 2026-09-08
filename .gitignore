@@ -6,3 +6,4 @@ __pycache__/
 # CV detour test tiles -- large, throwaway debug output, not a deliverable
 data/level3_cv_*.png
 data/level3_cv_*.npz
+data/pipeline_artifact.html

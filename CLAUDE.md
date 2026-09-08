@@ -185,6 +185,30 @@ Reservoir, known-broken).)
 ## Workflow
 
 - Commit after every working change, with a message explaining what changed and why.
+- **Rebuild the pipeline artifact whenever the CV pipeline's numbers change**, and republish it to
+  the same URL. This is part of committing that change, not a separate task:
+
+  ```
+  uv run --isolated --with numpy --with pillow python scripts/build_pipeline_artifact.py
+  ```
+
+  Then ask Claude to publish `data/pipeline_artifact.html` to
+  **https://claude.ai/code/artifact/7c58f59e-4634-4af5-b481-0eeb1baf31fc** (pass that as `url` so the
+  link stays the same). The HTML is gitignored — it is a build output; `scripts/build_pipeline_artifact.py`
+  is the source of truth.
+
+  **Why this is a rule and not a nicety.** The page states measured quantities — detection counts,
+  panel areas, the tilt-vs-area correlation, how much headroom the ground gate has left. A page of
+  hand-typed figures goes stale silently and keeps looking authoritative. That already happened:
+  five figures in *this file* were stale by the time the page was first built, and one of them
+  (ground-gate headroom, recorded as 8.9 m, actually 2.3 m) had stopped supporting the conclusion
+  drawn from it. So every figure on the page is read from `data/level3_cv_*_detections.npz` at build
+  time and nothing is transcribed — if a number can't be derived from the caches, it doesn't belong
+  on the page.
+
+  **Regenerating is scriptable; publishing is not.** A git hook can rebuild the HTML, but pushing it
+  to the artifact URL needs the Artifact tool and therefore a Claude session. Treat it as a checklist
+  item: change the pipeline → rerun both test areas → rebuild → republish.
 - Keep scripts runnable standalone: `uv run python scripts/whatever.py`.
 - Data files go in `data/`. Raw downloads in `data/raw/` and **gitignored** — they're large and re-downloadable.
 - If a script takes more than a few seconds, cache its output to disk so I'm not re-running it constantly.
