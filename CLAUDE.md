@@ -196,6 +196,21 @@ Reservoir, known-broken).)
   of it is not a measurement, it produces a number that cannot fail, and it is exactly how the
   false-positive audit got withdrawn. (`BLUE_PENALTY_SCALE` in `roof_geometry.py` was set this way and
   had to be redone from the positives alone.)
+- **Don't develop against known false positives.** Confirmed non-PV objects — currently the four
+  dormer skylights in Wiedikon — are excluded from the row-segmentation work entirely: not as test
+  objects, not as calibration, not as "the case it should reject". Build and evaluate on
+  confirmed-real arrays only.
+  **Why, concretely.** Including them produced two wrong conclusions in one session. The blue-excess
+  penalty was scaled so they would land mid-penalty, which is a number that cannot fail. Then the
+  structural score appeared to reject them (−0.197 separation) and it was an artifact: that building's
+  roof is corrugated, corrugation is periodic, and the score was faithfully finding the most periodic
+  thing present — the roof deck, not the glazing. Both readings looked like evidence and neither was.
+  **The separation of concerns is the point.** "Where are this array's rows" and "is this object PV at
+  all" are different questions with different failure modes. A row finder that also claims to verify
+  identity is a stage quietly assuming another stage's job, which is how the skylights reached p=0.95
+  in the first place. **False positives are a classifier problem and are deferred to their own
+  session** — the outstanding work there is measuring the rate against
+  `ch.bfe.elektrizitaetsproduktionsanlagen`, not patching it inside the geometry code.
 - **Rebuild the pipeline artifact whenever the CV pipeline's numbers change**, and republish it to
   the same URL. This is part of committing that change, not a separate task:
 
