@@ -184,7 +184,18 @@ Reservoir, known-broken).)
 
 ## Workflow
 
-- Commit after every working change, with a message explaining what changed and why.
+- **Don't commit unless I ask.** Make the change, tell me what changed and why, and leave it in the
+  working tree. I'll say "commit" when I want it committed. This replaces the old "commit after every
+  working change" rule — automatic commits made the history hard for me to follow and buried decisions
+  I hadn't agreed to yet.
+  When I do ask, the message should still explain what changed and why, including what was measured
+  and what was refuted.
+- **Never tune a threshold against a known negative example.** Set parameters from the positive class,
+  from physics, or from a measured plateau — then let the negatives be a *held-out check* that the
+  parameter passes or fails. Fitting a cutoff so that one known false positive lands on the right side
+  of it is not a measurement, it produces a number that cannot fail, and it is exactly how the
+  false-positive audit got withdrawn. (`BLUE_PENALTY_SCALE` in `roof_geometry.py` was set this way and
+  had to be redone from the positives alone.)
 - **Rebuild the pipeline artifact whenever the CV pipeline's numbers change**, and republish it to
   the same URL. This is part of committing that change, not a separate task:
 
