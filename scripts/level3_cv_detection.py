@@ -321,8 +321,15 @@ def get_zurich_altstetten_bbox():
     return bbox, (center_lon, center_lat)
 
 
-def fetch_swissimage_chip(bbox):
-    """Read the SWISSIMAGE 10cm window covering bbox, resampled to TARGET_MPP.
+def fetch_swissimage_chip(bbox, target_mpp=TARGET_MPP):
+    """Read the SWISSIMAGE 10cm window covering bbox, resampled to target_mpp.
+
+    target_mpp defaults to what the MODEL needs (0.2359 m/px). Pass
+    SWISSIMAGE_NATIVE_MPP to skip the resample and get the full 10 cm, which
+    is what row segmentation wants: the decimation to model scale throws away
+    2.36x of the detail, and a solar module is 1.0 x 1.7 m -- 10 x 17 px at
+    native, but only 4 x 7 px at model scale, where the frame grid between
+    cells is gone entirely.
 
     Mosaics all SWISSIMAGE tiles covering the bbox -- a bbox can straddle a
     tile boundary (SWISSIMAGE tiles are ~1km), and reading only one tile
@@ -349,7 +356,10 @@ def fetch_swissimage_chip(bbox):
     merge_bounds = rasterio.warp.transform_bounds("EPSG:4326", src_crs, *bbox)
     data, window_transform = merge_rasters(hrefs, bounds=merge_bounds, indexes=[1, 2, 3])
 
-    scale = SWISSIMAGE_NATIVE_MPP / TARGET_MPP  # ~0.42 -- downsampling, not up
+    if abs(target_mpp - SWISSIMAGE_NATIVE_MPP) < 1e-9:
+        return data, window_transform, src_crs      # native, nothing to resample
+
+    scale = SWISSIMAGE_NATIVE_MPP / target_mpp  # ~0.42 at model scale -- downsampling
     new_height = int(data.shape[1] * scale)
     new_width = int(data.shape[2] * scale)
 

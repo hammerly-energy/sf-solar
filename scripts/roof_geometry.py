@@ -231,6 +231,144 @@ def regularize_footprint(mask, mpp=TARGET_MPP, cell_m=MODULE_SHORT_EDGE_M):
     return back[pad_y : pad_y + h, pad_x : pad_x + w], theta
 
 
+# Solar module dimensions. A standard crystalline module is ~1.0 x 1.7 m, and
+# racked rows are spaced 2-6 m apart depending on tilt and latitude. At
+# SWISSIMAGE's native 0.1 m/px a module is 10 x 17 px and a row pitch is
+# 20-60 px -- both directly resolvable. At the 0.2359 m/px the MODEL needs,
+# a module is 4 x 7 px and the frame grid between cells is gone entirely,
+# which is why row segmentation works on native imagery and not on the chip
+# the detector ran against.
+MIN_ROW_WIDTH_M = 0.8       # narrower than one module in portrait -- not a row
+
+# Blue excess at which the panel-score penalty saturates. Set from four
+# objects only: three confirmed arrays measuring -0.077 to 0.000, and the
+# confirmed dormer-skylight false positive at +0.046. 0.10 puts the skylight
+# mid-penalty rather than saturated, so the score responds smoothly instead of
+# snapping, and it sits clear of the real arrays' upper edge.
+# WEAK EVIDENCE -- n=4, one negative. Recheck before trusting this elsewhere.
+BLUE_PENALTY_SCALE = 0.10
+
+
+def panel_score(rgb):
+    """Per-pixel "this looks like a solar panel" score in [0, 1] from native RGB.
+
+    MEASURED on native 10 cm SWISSIMAGE, over three confirmed arrays and the
+    one confirmed false positive (four dormer skylights the classifier scored
+    p=0.95):
+
+        object                    darkness   blue excess   texture
+        1976 m2 array               0.831       -0.077      0.068
+        232 m2 array                0.840        0.000      0.049
+        157 m2 array                0.879       -0.021      0.067
+        dormer skylights (NOT PV)   0.569       +0.046      0.039
+
+    where darkness = 1 - luminance, blue excess = (B-R)/(B+R), and texture is
+    the local standard deviation of luminance over ~0.9 m.
+
+    Note the sign on blue excess: real modules photograph neutral-to-warm and
+    it is the GLASS that is blue, because glazing reflects sky while an
+    anti-reflective-coated module absorbs it. The intuition that "panels are
+    blue" is backwards for this imagery.
+
+    `rgb` is (H, W, 3) uint8. Return a float array of the same H, W.
+    """
+    f = rgb.astype(float) / 255.0
+    R, G, B = f[..., 0], f[..., 1], f[..., 2]
+    luminance = 0.299 * R + 0.587 * G + 0.114 * B
+    darkness = 1.0 - luminance
+    blue_excess = (B - R) / (B + R + 1e-3)
+
+    # Darkness carries the row signal on its own -- panel bands are dark, the
+    # roof between them is bright. Blue excess is used only to PENALISE, never
+    # to reward, because that is the only direction the measurement supports:
+    # real modules sit at or below zero, so a blue pixel is evidence against
+    # PV, while a neutral one is not evidence for it.
+    penalty = np.clip(blue_excess / BLUE_PENALTY_SCALE, 0.0, 1.0)
+
+    # A partial penalty, not a veto. Real panels do pick up sky reflection at
+    # their edges and at grazing angles, and zeroing those pixels would eat
+    # the row boundaries this function exists to find. Half weight degrades
+    # the score without deleting the structure.
+    return np.clip(darkness * (1.0 - 0.5 * penalty), 0.0, 1.0)
+
+
+def row_profile(score, mask, theta_deg):
+    """Collapse a rotated array to a 1-D profile across its rows.
+
+    Rotates so the array's dominant edges lie on the axes, then averages
+    `score` along each row of the rotated frame, over masked pixels only --
+    roof outside the footprint would otherwise dilute the signal.
+
+    Returns (profile, coverage): mean score per rotated row, and how many
+    masked pixels contributed to each. Rows with little coverage are the
+    rotated frame's corners, not real measurements.
+    """
+    from scipy import ndimage
+
+    sq_score, box = _pad_square(np.zeros_like(score, dtype=bool))
+    pad_y, pad_x, h, w = box
+    big_s = np.zeros(sq_score.shape, dtype=float)
+    big_m = np.zeros(sq_score.shape, dtype=float)
+    big_s[pad_y:pad_y + h, pad_x:pad_x + w] = score
+    big_m[pad_y:pad_y + h, pad_x:pad_x + w] = mask.astype(float)
+
+    rs = ndimage.rotate(big_s, -theta_deg, reshape=False, order=1)
+    rm = ndimage.rotate(big_m, -theta_deg, reshape=False, order=1)
+
+    coverage = rm.sum(axis=1)
+    total = (rs * rm).sum(axis=1)
+    profile = np.divide(total, coverage, out=np.zeros_like(total), where=coverage > 0)
+    return profile, coverage
+
+
+def segment_rows(score, mask, mpp, theta_deg=None, min_coverage_px=4):
+    """Split one array's footprint into rack rows, from imagery alone.
+
+    A racked array alternates dark panel with bright roof, so the 1-D profile
+    across the rows is a square wave. Rows are the runs above the midpoint
+    between the profile's panel level and its gap level -- a midpoint, not a
+    tuned threshold, so there is no free parameter to fit.
+
+    Returns a dict with the row bands (in rotated-frame pixel coordinates),
+    the detected pitch, and the profile itself so a caller can plot it and
+    check the cut by eye rather than trusting the count.
+    """
+    from scipy import ndimage
+
+    if theta_deg is None:
+        # from the SCORE, not the mask: the mask's outline is one rectangle,
+        # while the score carries every module edge inside it
+        theta_deg = dominant_orientation_deg(score * mask)
+
+    profile, coverage = row_profile(score, mask, theta_deg)
+    usable = coverage >= min_coverage_px
+    if usable.sum() < 3:
+        return {"theta_deg": theta_deg, "n_rows": 0, "bands": [], "profile": profile,
+                "coverage": coverage, "pitch_m": None, "threshold": None}
+
+    vals = profile[usable]
+    lo, hi = np.percentile(vals, 10), np.percentile(vals, 90)
+    threshold = 0.5 * (lo + hi)
+
+    band_mask = usable & (profile >= threshold)
+    labels, n = ndimage.label(band_mask)
+    min_px = max(1, int(round(MIN_ROW_WIDTH_M / mpp)))
+    bands = []
+    for sl in ndimage.find_objects(labels):
+        if sl is None:
+            continue
+        start, stop = sl[0].start, sl[0].stop
+        if stop - start >= min_px:
+            bands.append((int(start), int(stop)))
+
+    centres = [0.5 * (a + b) for a, b in bands]
+    pitch_m = (float(np.median(np.diff(centres))) * mpp) if len(centres) > 1 else None
+
+    return {"theta_deg": float(theta_deg), "n_rows": len(bands), "bands": bands,
+            "profile": profile, "coverage": coverage, "pitch_m": pitch_m,
+            "threshold": float(threshold), "contrast": float(hi - lo)}
+
+
 def footprint_change(original, regularized, mpp=TARGET_MPP):
     """What regularization did, in the terms that matter downstream.
 
