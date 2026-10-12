@@ -156,7 +156,22 @@ Verified against the live STAC API; recorded here because the code still has the
 
 Backup candidates if Zurich hits a wall: Netherlands (PDOK/AHN, 25cm ortho + 6–10 pts/m² LiDAR, fully open) and Massachusetts, USA (MassGIS, 15cm ortho + QL1/QL2 LiDAR with DSM, public domain). Note both are *lower* density than the swissSURFACE3D point cloud (28.7 pts/m²) — there's no resolution argument for switching regions; the densest data we've found is already where we're working.
 
-Prototype code: `scripts/level3_cv_detection.py` (explicitly marked experimental, not part of the main pipeline). Model weights live in `data/raw/deepsolar_weights/` (gitignored, ~1.2GB — re-download via `gdown` from the Google Drive link in the DeepSolar-3M GitHub README if missing). Run with:
+**`cv` in filenames means computer vision** — the imagery-based detection branch. It was never spelled
+out anywhere until 2026-09-08; don't let a new abbreviation into this repo without expanding it once.
+
+Prototype code, two files (split 2026-09-08 by dependency, not by topic — the point is that the half
+where the silent-wrongness bugs live can be tested without the model stack):
+
+- **`scripts/roof_geometry.py`** — orientation, footprint regularization, plane fitting, the view vote,
+  plausibility gates, the registration NCC. **numpy + scipy + rasterio only, no torch.** Tests are
+  `scripts/test_roof_geometry.py`, which runs in seconds:
+  `uv run --isolated --with numpy --with scipy --with rasterio python scripts/test_roof_geometry.py`
+  (24 checks, all passing; coverage is PARTIAL — `fit_roof_plane()` produces the tilt and azimuth this
+  project depends on and still has no unit test.)
+- **`scripts/level3_cv_detection.py`** — the pipeline: bboxes, fetching, model loading, tiling,
+  `find_pv_arrays()`, `add_roof_geometry()`, all the plotting, `main()`. Imports from `roof_geometry`.
+
+Both explicitly experimental, not part of the main pipeline. Model weights live in `data/raw/deepsolar_weights/` (gitignored, ~1.2GB — re-download via `gdown` from the Google Drive link in the DeepSolar-3M GitHub README if missing). Run with:
 ```
 uv run --isolated --with "torch>=2.3" --with transformers==4.46.3 --with rasterio \
   --with pystac-client --with planetary-computer --with matplotlib --with requests --with scipy \
@@ -169,7 +184,85 @@ Reservoir, known-broken).)
 
 ## Workflow
 
-- Commit after every working change, with a message explaining what changed and why.
+- **Don't commit unless I ask.** Make the change, tell me what changed and why, and leave it in the
+  working tree. I'll say "commit" when I want it committed. This replaces the old "commit after every
+  working change" rule — automatic commits made the history hard for me to follow and buried decisions
+  I hadn't agreed to yet.
+  When I do ask, the message should still explain what changed and why, including what was measured
+  and what was refuted.
+- **Never tune a threshold against a known negative example.** Set parameters from the positive class,
+  from physics, or from a measured plateau — then let the negatives be a *held-out check* that the
+  parameter passes or fails. Fitting a cutoff so that one known false positive lands on the right side
+  of it is not a measurement, it produces a number that cannot fail, and it is exactly how the
+  false-positive audit got withdrawn. (`BLUE_PENALTY_SCALE` in `roof_geometry.py` was set this way and
+  had to be redone from the positives alone.)
+- **Don't develop against known false positives.** Confirmed non-PV objects — currently the four
+  dormer skylights in Wiedikon — are excluded from the row-segmentation work entirely: not as test
+  objects, not as calibration, not as "the case it should reject". Build and evaluate on
+  confirmed-real arrays only.
+  **Why, concretely.** Including them produced two wrong conclusions in one session. The blue-excess
+  penalty was scaled so they would land mid-penalty, which is a number that cannot fail. Then the
+  structural score appeared to reject them (−0.197 separation) and it was an artifact: that building's
+  roof is corrugated, corrugation is periodic, and the score was faithfully finding the most periodic
+  thing present — the roof deck, not the glazing. Both readings looked like evidence and neither was.
+  **The separation of concerns is the point.** "Where are this array's rows" and "is this object PV at
+  all" are different questions with different failure modes. A row finder that also claims to verify
+  identity is a stage quietly assuming another stage's job, which is how the skylights reached p=0.95
+  in the first place. **False positives are a classifier problem and are deferred to their own
+  session** — the outstanding work there is measuring the rate against
+  `ch.bfe.elektrizitaetsproduktionsanlagen`, not patching it inside the geometry code.
+- **Rebuild the pipeline artifact whenever the CV pipeline's numbers change**, and republish it to
+  the same URL. This is part of committing that change, not a separate task:
+
+  ```
+  uv run --isolated --with numpy --with pillow python scripts/build_pipeline_artifact.py
+  ```
+
+  Then ask Claude to publish `data/pipeline_artifact.html` to
+  **https://claude.ai/code/artifact/7c58f59e-4634-4af5-b481-0eeb1baf31fc** (pass that as `url` so the
+  link stays the same). The HTML is gitignored — it is a build output; `scripts/build_pipeline_artifact.py`
+  is the source of truth.
+
+  **Why this is a rule and not a nicety.** The page states measured quantities — detection counts,
+  panel areas, the tilt-vs-area correlation, how much headroom the ground gate has left. A page of
+  hand-typed figures goes stale silently and keeps looking authoritative. That already happened:
+  five figures in *this file* were stale by the time the page was first built, and one of them
+  (ground-gate headroom, recorded as 8.9 m, actually 2.3 m) had stopped supporting the conclusion
+  drawn from it. So every figure on the page is read from `data/level3_cv_*_detections.npz` at build
+  time and nothing is transcribed — if a number can't be derived from the caches, it doesn't belong
+  on the page.
+
+  **The rebuild half is automated.** `.githooks/pre-commit` rebuilds the HTML whenever a detection
+  cache is newer than it — i.e. whenever the pipeline has been re-run since the page was last built.
+  Enable it once per clone:
+
+  ```
+  git config core.hooksPath .githooks
+  ```
+
+  It keys off cache mtime rather than staged paths on purpose: editing `level3_cv_detection.py`
+  changes nothing on the page until the pipeline actually runs, so a staged-path trigger would fire
+  constantly and rebuild an identical file. **The hook never blocks a commit** — it exits 0 on every
+  path, including when the rebuild fails. Failing a commit over a documentation page would be worse
+  than a stale page.
+
+  **Publishing stays manual, and cannot be otherwise.** Pushing to the artifact URL needs the Artifact
+  tool and therefore a Claude session. The hook prints the reminder and the link; say "republish the
+  pipeline artifact" and it goes out on the same URL.
+
+  **Versions are cut by measurement, not by commit.** `data/pipeline_versions.json` (committed — it is
+  the record, not a build output) accumulates one entry per build in which a *tracked figure moved*.
+  Editing a comment in the pipeline is not a new version; re-running it and getting 30 arrays instead
+  of 29 is. The 22 tracked figures are declared in `TRACKED` in the build script — detection counts,
+  panel areas, ρ(area, tilt), median tilts either side of 120 m², steepest tilt, and lowest kept
+  detection, per test area. **To track a new claim the page makes, add it to `TRACKED`**; anything not
+  in that list can change silently.
+
+  Each entry records the commits landed since the previous entry rather than a single commit. That is
+  deliberate: the build runs from a pre-commit hook, so `HEAD` is the last *completed* commit and the
+  one being written does not exist yet — and in practice several commits sit between two pipeline
+  runs anyway, so "which commits moved this number" is the honest question. The hook stages the
+  history file so the entry ships in the commit whose work produced the numbers.
 - Keep scripts runnable standalone: `uv run python scripts/whatever.py`.
 - Data files go in `data/`. Raw downloads in `data/raw/` and **gitignored** — they're large and re-downloadable.
 - If a script takes more than a few seconds, cache its output to disk so I'm not re-running it constantly.
@@ -181,7 +274,7 @@ sf-solar/
 ├── CLAUDE.md
 ├── README.md
 ├── docs/            # architecture + roadmap
-├── scripts/         # standalone Python steps
+├── scripts/         # standalone Python steps (+ roof_geometry.py, imported by the CV pipeline)
 ├── data/
 │   ├── raw/         # gitignored
 │   └── latest.json  # published output
